@@ -1,6 +1,7 @@
 import os
 import sys
 from typing import List, Dict, Tuple
+from pathlib import Path
 
 import pandas as pd
 import mysql.connector
@@ -16,9 +17,29 @@ try:
 except Exception as e:
     raise RuntimeError("db-dtypes 패키지가 필요합니다. requirements 설치를 확인하세요.") from e
 
+def _load_env_from_project_root() -> None:
+    """run_pipeline.py가 위치한 프로젝트 루트(RecmdSys)에서 .env를 로드"""
+    try:
+        project_root = Path(__file__).resolve().parent.parent  # RecmdSys/
+        env_path = project_root / ".env"
+        if env_path.exists():
+            load_dotenv(str(env_path))
+    except Exception:
+        # 조용히 무시 (환경 변수는 시스템에서 가져오도록)
+        pass
 
-DATE_START = os.getenv("TRAIN_DATE_START", "2024-09-01")
+_load_env_from_project_root()
+
+DATE_START = os.getenv("TRAIN_DATE_START", "2025-08-01")
 DATE_END = os.getenv("TRAIN_DATE_END", "2025-08-31")
+
+# Ensure project root (RecmdSys/) is on sys.path so that `module/*` can be imported
+try:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+except Exception:
+    pass
 
 
 JOBS_QUERY = f"""
@@ -409,41 +430,26 @@ def clean_html_and_get_urls(html_string: str) -> Tuple[str, List[str]]:
 def detect_resume_content_columns(conn: MySQLConnection) -> List[str]:
     """
     information_schema를 조회해 RESUME 테이블에서 컨텐츠성 텍스트 컬럼을 자동 탐지합니다.
-    우선순위가 높은 패턴부터 반환합니다.
+    현재 정책: TITLE, CONTENT 두 컬럼만 사용합니다(있을 때만).
     """
-    patterns_in_order = [
-        '%resume_content%', '%content%', '%introduce%', '%introduction%', '%self_intro%',
-        '%selfintroduction%', '%profile%', '%description%', '%summary%', '%detail%', '%etc%'
-    ]
-
     sql = """
 SELECT COLUMN_NAME
 FROM information_schema.columns
 WHERE table_schema = DATABASE()
   AND table_name = 'RESUME'
-  AND (
-        COLUMN_NAME LIKE %s OR COLUMN_NAME LIKE %s OR COLUMN_NAME LIKE %s OR COLUMN_NAME LIKE %s OR
-        COLUMN_NAME LIKE %s OR COLUMN_NAME LIKE %s OR COLUMN_NAME LIKE %s OR COLUMN_NAME LIKE %s OR
-        COLUMN_NAME LIKE %s OR COLUMN_NAME LIKE %s OR COLUMN_NAME LIKE %s
-      )
 """
-    # 중복 제거를 위해 set 사용 후, 우선순위로 정렬
     try:
-        df = pd.read_sql(sql, conn, params=tuple(patterns_in_order))
+        df = pd.read_sql(sql, conn)
         cols = set(df['COLUMN_NAME'].astype(str).str.strip().tolist()) if not df.empty else set()
     except Exception:
         cols = set()
-
-    def priority_key(col: str) -> Tuple[int, str]:
-        for idx, pattern in enumerate(patterns_in_order):
-            # LIKE 패턴에서 % 제거 후 포함 여부로 우선순위 산정
-            needle = pattern.replace('%', '')
-            if needle and needle.lower() in col.lower():
-                return (idx, col)
-        return (len(patterns_in_order), col)
-
-    ordered_cols = sorted(cols, key=priority_key)
-    return ordered_cols
+    # TITLE, CONTENT만 채택 (대소문자 무시)
+    selected = []
+    if any(c.lower() == 'title' for c in cols):
+        selected.append('TITLE')
+    if any(c.lower() == 'content' for c in cols):
+        selected.append('CONTENT')
+    return selected
 
 
 def fetch_resume_raw_html_for_users(
@@ -489,31 +495,24 @@ LEFT JOIN RESUME r ON r.RESUME_IDX = dr.RESUME_IDX;
 
 def build_clean_resume_fields(raw_resume_df: pd.DataFrame, preferred_order: List[str]) -> pd.DataFrame:
     """
-    여러 HTML 컬럼에서 가장 내용이 있는 것을 우선순위대로 선택해 텍스트만 생성합니다.
-    반환: U_ID, RESUME_TEXT
+    RESUME 테이블의 TITLE, CONTENT 두 컬럼만 사용해 텍스트를 생성합니다.
+    반환: U_ID, RESUME_TEXT (TITLE + 공백행 + CONTENT 순서)
     """
     if raw_resume_df.empty:
         return pd.DataFrame(columns=["U_ID", "RESUME_TEXT"])
 
-    def pick_first_html(row) -> str:
-        for col in preferred_order:
-            if col in row and isinstance(row[col], str) and row[col].strip():
-                return row[col]
-        # 우선순위 외 컬럼에서도 비어있지 않은 첫 값 선택 (안전장치)
-        for col in raw_resume_df.columns:
-            if col == 'U_ID':
-                continue
-            val = row.get(col)
-            if isinstance(val, str) and val.strip():
-                return val
-        return ""
-
-    html_series = raw_resume_df.apply(pick_first_html, axis=1)
+    # TITLE/CONTENT 컬럼만 사용 (없으면 빈 문자열)
+    title_col = 'TITLE' if 'TITLE' in raw_resume_df.columns else None
+    content_col = 'CONTENT' if 'CONTENT' in raw_resume_df.columns else None
 
     texts: List[str] = []
-    for html_str in html_series.tolist():
-        text, _urls = clean_html_and_get_urls(html_str)
-        texts.append(text)
+    for _, row in raw_resume_df.iterrows():
+        title_html = (row.get(title_col) if title_col else "") or ""
+        content_html = (row.get(content_col) if content_col else "") or ""
+        title_text = clean_html_and_get_urls(str(title_html))[0] if title_html else ""
+        content_text = clean_html_and_get_urls(str(content_html))[0] if content_html else ""
+        combined = "\n\n".join([t for t in [title_text.strip(), content_text.strip()] if t])
+        texts.append(combined)
 
     out_df = pd.DataFrame({
         "U_ID": raw_resume_df["U_ID"],

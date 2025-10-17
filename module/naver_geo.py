@@ -4,9 +4,23 @@ from __future__ import annotations
 import os
 import requests
 from typing import Tuple, Optional, List, Dict, Any
+from pathlib import Path
+from dotenv import load_dotenv
 
 NAVER_GEOCODE_URL = "https://maps.apigw.ntruss.com/map-geocode/v2/geocode"
 NAVER_DIRECTIONS_URL = "https://maps.apigw.ntruss.com/map-direction/v1/driving"
+def _load_env_from_project_root() -> None:
+    """Load .env from project root (where run_pipeline.py resides)"""
+    try:
+        project_root = Path(__file__).resolve().parent.parent
+        env_path = project_root / ".env"
+        if env_path.exists():
+            load_dotenv(str(env_path))
+    except Exception:
+        pass
+
+_load_env_from_project_root()
+
 
 
 def _get_naver_headers() -> Dict[str, str]:
