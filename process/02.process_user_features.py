@@ -9,29 +9,38 @@ from typing import Dict, Tuple, Optional
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+from pathlib import Path
 
 import pandas as pd
 from dotenv import load_dotenv
 
 
-# Ensure we can import the NAVER geocoding utility from the sibling project
-GEOCODE_MODULE_PATH = "/SPO/Project/RecSys/scripts/module/"
-if GEOCODE_MODULE_PATH not in sys.path:
-    sys.path.append(GEOCODE_MODULE_PATH)
+# Ensure project root (RecmdSys/) is on sys.path for absolute imports like `module.*`
+try:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+except Exception:
+    pass
 
 try:
-    from naver_geo import geocode_naver  # type: ignore
+    from module.naver_geo import geocode_naver  # type: ignore
 except Exception as import_err:
-    raise RuntimeError(f"Failed to import geocoding module from {GEOCODE_MODULE_PATH}: {import_err}")
+    raise RuntimeError(f"Failed to import geocoding module from project module path: {import_err}")
 
 
 def load_environment() -> None:
-    # Load environment variables (NAVER, OPENAI, etc.)
-    # Use .env file in current directory first, fallback to parent
-    if os.path.exists(".env"):
-        load_dotenv(".env")
-    elif os.path.exists(os.path.join(os.path.dirname(__file__), ".env")):
-        load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+    # Always load from project root (run_pipeline.py location)
+    try:
+        from pathlib import Path
+        project_root = Path(__file__).resolve().parent.parent
+        env_path = project_root / ".env"
+        if env_path.exists():
+            load_dotenv(str(env_path))
+    except Exception:
+        # fallback: current working dir
+        if os.path.exists(".env"):
+            load_dotenv(".env")
 
 
 def get_openai_client():
@@ -276,6 +285,28 @@ def main():
             except Exception:
                 included_df.iat[idx, included_df.columns.get_loc("RESUME_EMB_4096")] = pd.NA
 
+    # Merge geocoding results from df into included_df (preserve original by index)
+    geo_cols = [
+        "geo_ADDR_lat", "geo_ADDR_lon",
+        "geo_OFFICE_ADDR_lat", "geo_OFFICE_ADDR_lon",
+        "geo_ADDR_src", "geo_OFFICE_ADDR_src",
+    ]
+    if args.verbose:
+        for col in ["geo_ADDR_lat", "geo_ADDR_lon"]:
+            if col in df.columns:
+                non_null = df[col].notna().sum()
+                print(f"[DEBUG] df.{col}: {non_null}/{len(df)} non-null values")
+
+    for col in geo_cols:
+        if col in df.columns:
+            included_df.loc[:, col] = df.loc[included_df.index, col]
+
+    if args.verbose:
+        for col in ["geo_ADDR_lat", "geo_ADDR_lon"]:
+            if col in included_df.columns:
+                non_null = included_df[col].notna().sum()
+                print(f"[DEBUG] included_df.{col}: {non_null}/{len(included_df)} non-null values")
+
     # Select required columns only
     keep_cols = [
         "U_ID",
@@ -288,11 +319,11 @@ def main():
         "BOARD_IDX",
         "RESUME_EMB_4096",
     ]
-    # Ensure missing columns exist
+    # Ensure missing columns exist in included_df
     for c in keep_cols:
-        if c not in df.columns:
-            df[c] = pd.NA
-    # 최종 결과: 네 요소 모두 없는 사용자는 제외
+        if c not in included_df.columns:
+            included_df[c] = pd.NA
+    # 최종 결과
     out_df = included_df[keep_cols]
 
     # Save outputs

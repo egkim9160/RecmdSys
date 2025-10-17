@@ -29,7 +29,7 @@ FEATURE_COLUMNS = [
     "spec_match",
     "distance_home",
     "distance_office",
-    "CAREER_YEARS",
+#    "CAREER_YEARS",
 #    "PAY",
     # 경력 매칭 관련 추가 특성
     "career_match",
@@ -388,7 +388,7 @@ def main() -> None:
     parser.add_argument("--test_size", type=float, default=0.2)
     parser.add_argument("--random_seed", type=int, default=42)
     parser.add_argument("--top_k_importances", type=int, default=20)
-    parser.add_argument("--cv_folds", type=int, default=0, help="0이면 홀드아웃, >0이면 K-fold")
+    parser.add_argument("--cv_folds", type=int, default=5, help="0이면 홀드아웃, >0이면 K-fold (기본 5)")
     parser.add_argument("--group_by_doctor", action="store_true", help="doctor_id 기준 그룹 분할")
 
     # 하이퍼파라미터 CLI 인자 제거: 기본 상수와 JSON 병합 사용
@@ -565,6 +565,15 @@ def run_kfold(df: pd.DataFrame, args: argparse.Namespace) -> None:
         train_df = df.iloc[train_idx].reset_index(drop=True)
         valid_df = df.iloc[valid_idx].reset_index(drop=True)
 
+        # Save train/test datasets for this fold
+        try:
+            train_path = os.path.join(fold_dir, "train.csv")
+            test_path = os.path.join(fold_dir, "test.csv")
+            train_df.to_csv(train_path, index=False)
+            valid_df.to_csv(test_path, index=False)
+        except Exception:
+            pass
+
         with open(os.path.join(fold_dir, "data_info.json"), "w") as f:
             json.dump(
                 {
@@ -653,13 +662,16 @@ def run_tuning(df: pd.DataFrame, args: argparse.Namespace, base_out: str) -> Non
     os.makedirs(base_out, exist_ok=True)
     run_dir = base_out
 
-    if args.group_by_doctor:
-        groups = df["doctor_id"].values
-        splitter = GroupKFold(n_splits=max(args.cv_folds, 3))
-        splits = list(splitter.split(df[FEATURE_COLUMNS], df["applied"].values, groups=groups))
-    else:
-        splitter = StratifiedKFold(n_splits=max(args.cv_folds, 3), shuffle=True, random_state=args.random_seed)
-        splits = list(splitter.split(df[FEATURE_COLUMNS], df["applied"].values))
+    # If cv_folds <= 0, perform holdout tuning with args.test_size (no CV)
+    use_holdout = args.cv_folds is None or int(args.cv_folds) <= 0
+    if not use_holdout:
+        if args.group_by_doctor:
+            groups = df["doctor_id"].values
+            splitter = GroupKFold(n_splits=args.cv_folds)
+            splits = list(splitter.split(df[FEATURE_COLUMNS], df["applied"].values, groups=groups))
+        else:
+            splitter = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=args.random_seed)
+            splits = list(splitter.split(df[FEATURE_COLUMNS], df["applied"].values))
 
     def objective_xgb(trial: "optuna.trial.Trial") -> float:
         # Suggest params
@@ -675,6 +687,13 @@ def run_tuning(df: pd.DataFrame, args: argparse.Namespace, base_out: str) -> Non
             "use_gpu": args.use_gpu,
             "gpu_id": args.gpu_id,
         }
+        if use_holdout:
+            train_df, valid_df = stratified_split(df, test_size=args.test_size, seed=args.random_seed)
+            spw = compute_class_weights(train_df["applied"].values)
+            params_with_spw = dict(params)
+            params_with_spw["scale_pos_weight"] = spw
+            _model, metrics, _ = train_xgboost(train_df, valid_df, args.random_seed, params_with_spw)
+            return float(metrics.get("roc_auc", 0.0))
         aucs = []
         for train_idx, valid_idx in splits:
             train_df = df.iloc[train_idx].reset_index(drop=True)
@@ -682,7 +701,7 @@ def run_tuning(df: pd.DataFrame, args: argparse.Namespace, base_out: str) -> Non
             spw = compute_class_weights(train_df["applied"].values)
             params_with_spw = dict(params)
             params_with_spw["scale_pos_weight"] = spw
-            model, metrics, _ = train_xgboost(train_df, valid_df, args.random_seed, params_with_spw)
+            _model, metrics, _ = train_xgboost(train_df, valid_df, args.random_seed, params_with_spw)
             aucs.append(metrics["roc_auc"])
         return float(np.mean(aucs))
 
@@ -700,11 +719,15 @@ def run_tuning(df: pd.DataFrame, args: argparse.Namespace, base_out: str) -> Non
             "use_gpu": args.use_gpu,
             "gpu_id": args.gpu_id,
         }
+        if use_holdout:
+            train_df, valid_df = stratified_split(df, test_size=args.test_size, seed=args.random_seed)
+            _model, metrics, _ = train_lightgbm(train_df, valid_df, args.random_seed, params)
+            return float(metrics.get("roc_auc", 0.0))
         aucs = []
         for train_idx, valid_idx in splits:
             train_df = df.iloc[train_idx].reset_index(drop=True)
             valid_df = df.iloc[valid_idx].reset_index(drop=True)
-            model, metrics, _ = train_lightgbm(train_df, valid_df, args.random_seed, params)
+            _model, metrics, _ = train_lightgbm(train_df, valid_df, args.random_seed, params)
             aucs.append(metrics["roc_auc"])
         return float(np.mean(aucs))
 

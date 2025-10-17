@@ -39,22 +39,31 @@ DEFAULT_OUT_DIR = f"/SPO/Project/RecSys/data/processed/job_features_{FIXED_TS}"
 # -----------------------------
 # 환경 로딩 / 외부 유틸
 # -----------------------------
-GEOCODE_MODULE_PATH = "/SPO/Project/RecSys/scripts/module/" 
-if GEOCODE_MODULE_PATH not in sys.path:
-    sys.path.append(GEOCODE_MODULE_PATH)
+from pathlib import Path
+try:
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    if str(PROJECT_ROOT) not in sys.path:
+        sys.path.insert(0, str(PROJECT_ROOT))
+except Exception:
+    pass
 
 try:
-    from naver_geo import geocode_naver  # type: ignore
+    from module.naver_geo import geocode_naver  # type: ignore
 except Exception as import_err:
-    raise RuntimeError(f"Failed to import geocoding module from {GEOCODE_MODULE_PATH}: {import_err}")
+    raise RuntimeError(f"Failed to import geocoding module from project module path: {import_err}")
 
 
 def load_environment() -> None:
-    # Use .env file in current directory first, fallback to parent
-    if os.path.exists(".env"):
-        load_dotenv(".env")
-    elif os.path.exists(os.path.join(os.path.dirname(__file__), ".env")):
-        load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+    # Always load from project root (run_pipeline.py location)
+    try:
+        from pathlib import Path
+        project_root = Path(__file__).resolve().parent.parent
+        env_path = project_root / ".env"
+        if env_path.exists():
+            load_dotenv(str(env_path))
+    except Exception:
+        if os.path.exists(".env"):
+            load_dotenv(".env")
 
 
 def get_openai_client():
