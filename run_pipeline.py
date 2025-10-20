@@ -214,7 +214,7 @@ class PipelineRunner:
                     "--model_path", str(model_path),
                     "--input_csv", str(training_csv),
                     "--output_dir", str(output_dir),
-                    "--no_plots",
+#                    "--no_plots",
                 ]
                 self.log_debug(f"SHAP 실행 명령어: {' '.join(cmd)}")
                 start_time = time.time()
