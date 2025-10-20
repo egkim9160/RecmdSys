@@ -234,11 +234,18 @@ def build_training_pairs(
             else:
                 career_irrelevant = 0
                 if min_req is not None and max_req is not None:
-                    career_match = 1 if (int(career_years) >= min_req and int(career_years) <= max_req) else 0
-                    career_gap = int(career_years) - min_req
+                    c = int(career_years)
+                    career_match = 1 if (c >= min_req and c <= max_req) else 0
+                    if c < min_req:
+                        career_gap = min_req - c
+                    elif c > max_req:
+                        career_gap = c - max_req
+                    else:
+                        career_gap = 0
                 elif min_req is not None and max_req is None:
-                    career_match = 1 if int(career_years) >= min_req else 0
-                    career_gap = int(career_years) - min_req
+                    c = int(career_years)
+                    career_match = 1 if c >= min_req else 0
+                    career_gap = 0 if c >= min_req else (min_req - c)
                 else:
                     # 조건 파싱 불가능 → 조건 없음으로 간주
                     career_irrelevant = 1

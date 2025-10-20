@@ -30,7 +30,7 @@ def _load_env_from_project_root() -> None:
 
 _load_env_from_project_root()
 
-DATE_START = os.getenv("TRAIN_DATE_START", "2025-08-01")
+DATE_START = os.getenv("TRAIN_DATE_START", "2024-09-01")
 DATE_END = os.getenv("TRAIN_DATE_END", "2025-08-31")
 
 # Ensure project root (RecmdSys/) is on sys.path so that `module/*` can be imported
