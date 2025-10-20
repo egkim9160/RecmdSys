@@ -133,6 +133,8 @@ def build_training_pairs(
     users_filtered["SPECIALTY_NORM"] = users_filtered["SPECIALTY"].apply(normalize_specialty_label)
     users_filtered = users_filtered.dropna(subset=["SPECIALTY_NORM"]).copy()
 
+    # 요청에 따라 과다 지원 의사 제외 로직 제거: 전체 데이터를 사용
+
     records: List[dict] = []
 
     # Parse embedding vectors (JSON -> normalized np.array)
