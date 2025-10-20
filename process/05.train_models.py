@@ -643,16 +643,16 @@ def run_kfold(df: pd.DataFrame, args: argparse.Namespace) -> None:
             save_reports(fold_dir, "logi", logi_model, logi_metrics, logi_coefs, y_valid, y_prob)
             all_metrics["logi"].append(logi_metrics)
 
-    # Aggregate metrics
+    # Aggregate metrics (mean and std), overwrite summary
     summary = {}
     for model_name, metrics_list in all_metrics.items():
         if not metrics_list:
             continue
         keys = metrics_list[0].keys()
-        summary[model_name] = {
-            k: float(np.mean([m[k] for m in metrics_list])) for k in keys
-        }
-    with open(os.path.join(run_dir, "cv_summary.json"), "a") as f:
+        mean_dict = {k: float(np.mean([m[k] for m in metrics_list])) for k in keys}
+        std_dict = {k: float(np.std([m[k] for m in metrics_list])) for k in keys}
+        summary[model_name] = {"mean": mean_dict, "std": std_dict, "folds": metrics_list}
+    with open(os.path.join(run_dir, "cv_summary.json"), "w") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     print(run_dir)
 

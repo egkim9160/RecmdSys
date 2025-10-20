@@ -105,7 +105,7 @@ def main() -> None:
     parser.add_argument("--model_json", type=str, required=True)
     parser.add_argument("--input_csv", type=str, required=True)
     parser.add_argument("--output_csv", type=str,  help="지정 시 해당 파일에 결과 저장, 미지정 시 현재 디렉토리에 inferred.csv 파일 생성")
-    parser.add_argument("--threshold", type=float, default=None, help="기본 0.5. 미지정 시 calibrate_* 옵션으로 산출 가능")
+    parser.add_argument("--threshold", type=float, default=None, help="기본 0.5. 파이프라인에선 별도 루프에서 다중 저장")
     parser.add_argument("--features_json", type=str, default="", help="data_info.json 경로(선택)")
 
     # Optional: threshold calibration on a labeled CSV having a column named 'applied'
