@@ -2,7 +2,11 @@
 """LLM and OpenAI client utilities"""
 import os
 import json
+import logging
 from typing import Optional, List
+
+# Setup logger
+logger = logging.getLogger(__name__)
 
 
 def get_openai_client():
@@ -10,10 +14,12 @@ def get_openai_client():
     try:
         from openai import OpenAI
     except Exception:
+        logger.warning("[LLM] OpenAI library not available")
         return None
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
+        logger.warning("[LLM] OPENAI_API_KEY not set")
         return None
 
     base_url = os.getenv("OPENAI_BASE_URL")
@@ -21,10 +27,13 @@ def get_openai_client():
     try:
         if base_url:
             client = OpenAI(api_key=api_key, base_url=base_url)
+            logger.info(f"[LLM] OpenAI client initialized with base_url={base_url}")
         else:
             client = OpenAI(api_key=api_key)
+            logger.info("[LLM] OpenAI client initialized with default URL")
         return client
-    except Exception:
+    except Exception as e:
+        logger.error(f"[LLM] Failed to initialize OpenAI client: {e}")
         return None
 
 
@@ -33,14 +42,19 @@ def get_embedding_client():
     try:
         from openai import OpenAI
     except Exception:
+        logger.warning("[EMBED] OpenAI library not available")
         return None
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
+        logger.warning("[EMBED] OPENAI_API_KEY not set")
         return None
     base_url = os.getenv("OPENAI_BASE_URL") or "https://llm-api.medigate.net/embedding/v1"
     try:
-        return OpenAI(api_key=api_key, base_url=base_url, timeout=240)
-    except Exception:
+        client = OpenAI(api_key=api_key, base_url=base_url, timeout=240)
+        logger.info(f"[EMBED] Embedding client initialized with base_url={base_url}")
+        return client
+    except Exception as e:
+        logger.error(f"[EMBED] Failed to initialize embedding client: {e}")
         return None
 
 
@@ -72,6 +86,7 @@ def clean_address_with_llm(raw_address: str, client) -> Optional[str]:
     Returns None if client is unavailable or on failure.
     """
     if client is None:
+        logger.warning("[LLM] clean_address_with_llm called but client is None")
         return None
 
     model = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
@@ -82,6 +97,7 @@ def clean_address_with_llm(raw_address: str, client) -> Optional[str]:
     )
     user_prompt = f"원본 주소: {raw_address}\n정제된 주소:"
 
+    logger.info(f"[LLM] clean_address_with_llm request: raw_address='{raw_address}'")
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -89,17 +105,19 @@ def clean_address_with_llm(raw_address: str, client) -> Optional[str]:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.0,
-            max_tokens=128,
         )
         text = resp.choices[0].message.content.strip() if resp and resp.choices else None
         if not text:
+            logger.warning(f"[LLM] clean_address_with_llm: empty response for '{raw_address}'")
             return None
         # Heuristic: remove wrapping quotes if present
         text = text.strip().strip('"').strip("'")
         # Very short outputs are suspicious
         if len(text) < 4:
+            logger.warning(f"[LLM] clean_address_with_llm: response too short ('{text}') for '{raw_address}'")
             return None
+        logger.info(f"[LLM] clean_address_with_llm success: '{raw_address}' -> '{text}'")
         return text
-    except Exception:
+    except Exception as e:
+        logger.error(f"[LLM] clean_address_with_llm error for '{raw_address}': {e}")
         return None

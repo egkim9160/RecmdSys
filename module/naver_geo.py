@@ -2,10 +2,14 @@
 # naver_geo.py
 from __future__ import annotations
 import os
+import logging
 import requests
 from typing import Tuple, Optional, List, Dict, Any
 from pathlib import Path
 from dotenv import load_dotenv
+
+# Setup logger
+logger = logging.getLogger(__name__)
 
 NAVER_GEOCODE_URL = "https://maps.apigw.ntruss.com/map-geocode/v2/geocode"
 NAVER_DIRECTIONS_URL = "https://maps.apigw.ntruss.com/map-direction/v1/driving"
@@ -37,17 +41,25 @@ def _get_naver_headers() -> Dict[str, str]:
 
 
 def geocode_naver(address: str) -> Tuple[float, float]:
+    logger.info(f"[GEOCODE] Request: address='{address}'")
     params = {"query": address}
-    r = requests.get(NAVER_GEOCODE_URL, params=params, headers=_get_naver_headers(), timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    addresses = data.get("addresses", [])
-    if not addresses:
-        raise ValueError(f"지오코딩 실패: {data}")
-    first = addresses[0]
-    lon = float(first["x"])  # 경도
-    lat = float(first["y"])  # 위도
-    return (lat, lon)
+    try:
+        r = requests.get(NAVER_GEOCODE_URL, params=params, headers=_get_naver_headers(), timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        logger.debug(f"[GEOCODE] Response: {data}")
+        addresses = data.get("addresses", [])
+        if not addresses:
+            logger.warning(f"[GEOCODE] Failed: no addresses found for '{address}'")
+            raise ValueError(f"지오코딩 실패: {data}")
+        first = addresses[0]
+        lon = float(first["x"])  # 경도
+        lat = float(first["y"])  # 위도
+        logger.info(f"[GEOCODE] Success: address='{address}' -> lat={lat}, lon={lon}")
+        return (lat, lon)
+    except Exception as e:
+        logger.error(f"[GEOCODE] Error for address='{address}': {e}")
+        raise
 
 
 def get_directions5_summary(

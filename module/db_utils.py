@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Database utility functions for MySQL connection"""
 import os
+import logging
 from mysql.connector.connection import MySQLConnection
 import mysql.connector
 from dotenv import load_dotenv
 from pathlib import Path
+
+# Setup logger
+logger = logging.getLogger(__name__)
 
 
 def get_connection() -> MySQLConnection:
@@ -24,4 +28,11 @@ def get_connection() -> MySQLConnection:
         database=os.getenv("DB_NAME"),
         charset="utf8mb4",
     )
-    return mysql.connector.connect(**cfg)
+    logger.info(f"[DB] Connecting to MySQL: host={cfg['host']}, user={cfg['user']}, database={cfg['database']}")
+    try:
+        conn = mysql.connector.connect(**cfg)
+        logger.info("[DB] Connection established successfully")
+        return conn
+    except Exception as e:
+        logger.error(f"[DB] Connection failed: {e}")
+        raise
