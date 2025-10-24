@@ -37,7 +37,8 @@ def get_embedding_client():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
-    base_url = os.getenv("OPENAI_BASE_URL") or "https://llm-api.medigate.net/embedding/v1"
+    # 고정 엔드포인트 사용 (요청 사항)
+    base_url = "https://llm-api.medigate.net/embedding/v1"
     try:
         return OpenAI(api_key=api_key, base_url=base_url, timeout=240)
     except Exception:
@@ -58,7 +59,11 @@ def batch_embed_texts(client, texts: List[str], model: str = "text-embedding-3-l
             for i, v in enumerate(vecs):
                 embeddings[start + i] = v
         return embeddings
-    except Exception:
+    except Exception as embed_err:
+        try:
+            print(f"[EMBED][WARN] embedding request failed: {embed_err}")
+        except Exception:
+            pass
         return embeddings
 
 

@@ -32,6 +32,7 @@ _load_env_from_project_root()
 
 DATE_START = os.getenv("TRAIN_DATE_START", "2024-09-01")
 DATE_END = os.getenv("TRAIN_DATE_END", "2025-08-31")
+print(f"[DATE] Using date range: {DATE_START} ~ {DATE_END}")
 
 # Ensure project root (RecmdSys/) is on sys.path so that `module/*` can be imported
 try:
@@ -568,6 +569,10 @@ WHERE U_ID IN UNNEST(@user_ids)
 
 
 def main():
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--out_dir", type=str, default="data/raw", help="출력 디렉터리 (기본: data/raw)")
+    args = p.parse_args()
     print("환경 변수 로드 및 DB 연결 시도...")
     t_start = time.time()
     try:
@@ -713,9 +718,9 @@ def main():
 
     print("4) CSV 저장(디버깅 용이성 우선)...")
     t4 = time.time()
-    os.makedirs("data/raw", exist_ok=True)
-    jobs_df.to_csv("data/raw/job_features.csv", index=False)
-    user_feat_df.to_csv("data/raw/user_features.csv", index=False)
+    os.makedirs(args.out_dir, exist_ok=True)
+    jobs_df.to_csv(os.path.join(args.out_dir, "job_features.csv"), index=False)
+    user_feat_df.to_csv(os.path.join(args.out_dir, "user_features.csv"), index=False)
     print(f"[time] 4) CSV 저장: {time.time() - t4:.2f}s")
 
     print("완료: data/raw/ 하위에 job_features.csv, user_features.csv 저장")

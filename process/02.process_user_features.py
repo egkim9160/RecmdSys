@@ -275,6 +275,8 @@ def main():
 
     texts = included_df["EMBED_TEXT"].astype(str).tolist()
     emb_client = get_embedding_client()
+    if args.verbose:
+        print(f"[EMBED] client={'on' if emb_client is not None else 'off'} model={args.embed_model} batch={args.embed_batch}")
     emb_vecs = _batch_embed_texts(emb_client, texts, model=args.embed_model, batch_size=max(1, int(args.embed_batch)))
 
     included_df["RESUME_EMB_4096"] = pd.NA

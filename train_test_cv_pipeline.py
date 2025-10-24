@@ -10,29 +10,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent  # RecmdSys/
 
 
 def run(cmd: list[str], *, cwd: Path, env: dict | None = None) -> None:
-    proc = subprocess.run(cmd, cwd=str(cwd), text=True)
+    proc = subprocess.run(cmd, cwd=str(cwd), text=True, env=env)
     if proc.returncode != 0:
         raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
-
-
-def move_raw_outputs(src_dir: Path, dst_dir: Path) -> Tuple[Path, Path]:
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    jf = src_dir / "job_features.csv"
-    uf = src_dir / "user_features.csv"
-    if not jf.exists() or not uf.exists():
-        raise FileNotFoundError("parse_raw_dataset 산출물(job_features.csv, user_features.csv)이 없습니다.")
-    jf_dst = dst_dir / "job_features.csv"
-    uf_dst = dst_dir / "user_features.csv"
-    jf_dst.write_bytes(jf.read_bytes())
-    uf_dst.write_bytes(uf.read_bytes())
-    return uf_dst, jf_dst
-
-
-def latest_csv(dir_path: Path, prefix: str) -> Path:
-    cands = sorted(dir_path.glob(f"{prefix}_*.csv"), reverse=True)
-    if not cands:
-        raise FileNotFoundError(f"{dir_path} 내에 {prefix}_*.csv 파일이 없습니다.")
-    return cands[0]
 
 
 def main() -> None:
@@ -54,29 +34,29 @@ def main() -> None:
     env_train = os.environ.copy()
     env_train["TRAIN_DATE_START"] = TRAIN_DATE_START
     env_train["TRAIN_DATE_END"] = TRAIN_DATE_END
-    run([sys.executable, str(PROJECT_ROOT / "process" / "01.parse_raw_dataset.py")], cwd=work_dir, env=env_train)
-    uf_train, jf_train = move_raw_outputs(data_raw, data_raw / "train")
+    raw_train_dir = data_raw / "train"
+    run([sys.executable, str(PROJECT_ROOT / "process" / "01.parse_raw_dataset.py"), "--out_dir", str(raw_train_dir)], cwd=work_dir, env=env_train)
 
     # 1-2) Raw 파싱 - test
     env_test = os.environ.copy()
     env_test["TRAIN_DATE_START"] = TEST_DATE_START
     env_test["TRAIN_DATE_END"] = TEST_DATE_END
-    run([sys.executable, str(PROJECT_ROOT / "process" / "01.parse_raw_dataset.py")], cwd=work_dir, env=env_test)
-    uf_test, jf_test = move_raw_outputs(data_raw, data_raw / "test")
+    raw_test_dir = data_raw / "test"
+    run([sys.executable, str(PROJECT_ROOT / "process" / "01.parse_raw_dataset.py"), "--out_dir", str(raw_test_dir)], cwd=work_dir, env=env_test)
 
     # 2) User features 처리 (train/test)
     run([sys.executable, str(PROJECT_ROOT / "process" / "02.process_user_features.py"),
-         "--input", str(uf_train), "--out_dir", str(data_proc / "train")], cwd=work_dir)
+         "--input", str(raw_train_dir / "user_features.csv"), "--out_dir", str(data_proc / "train")], cwd=work_dir)
     run([sys.executable, str(PROJECT_ROOT / "process" / "02.process_user_features.py"),
-         "--input", str(uf_test), "--out_dir", str(data_proc / "test")], cwd=work_dir)
+         "--input", str(raw_test_dir / "user_features.csv"), "--out_dir", str(data_proc / "test")], cwd=work_dir)
 
     # 3) Job features 처리 (train/test)
     run([sys.executable, str(PROJECT_ROOT / "process" / "03.process_job_features.py"),
-         "--input", str(jf_train), "--out_dir", str(data_proc / "train"), "--concurrency", "50", "--log-interval", "500"], cwd=work_dir)
+         "--input", str(raw_train_dir / "job_features.csv"), "--out_dir", str(data_proc / "train"), "--concurrency", "50", "--log-interval", "500"], cwd=work_dir)
     run([sys.executable, str(PROJECT_ROOT / "process" / "03.process_job_features.py"),
-         "--input", str(jf_test), "--out_dir", str(data_proc / "test"), "--concurrency", "50", "--log-interval", "500"], cwd=work_dir)
+         "--input", str(raw_test_dir / "job_features.csv"), "--out_dir", str(data_proc / "test"), "--concurrency", "50", "--log-interval", "500"], cwd=work_dir)
 
-    # 4) Training pairs 병합 (train/test) + 과다지원 의사 제외는 04 스크립트 내부 로직에 포함되어 적용됨
+    # 4) Training pairs 병합 (train/test)
     run([sys.executable, str(PROJECT_ROOT / "process" / "04.merge_to_training_table.py"),
          "--user_csv", str(data_proc / "train" / "user_features_processed.csv"),
          "--job_csv", str(data_proc / "train" / "job_training_view.csv"),
@@ -87,6 +67,13 @@ def main() -> None:
          "--out_dir", str(data_train / "test")], cwd=work_dir)
 
     # 5) CV(5-fold) 강제 학습 (XGBoost)
+    from pathlib import Path as _Path
+    def latest_csv(dir_path: _Path, prefix: str) -> _Path:
+        cands = sorted(dir_path.glob(f"{prefix}_*.csv"), reverse=True)
+        if not cands:
+            raise FileNotFoundError(f"{dir_path} 내에 {prefix}_*.csv 파일이 없습니다.")
+        return cands[0]
+
     train_csv = latest_csv(data_train / "train", "training_pairs")
     models_dir.mkdir(parents=True, exist_ok=True)
     run([sys.executable, str(PROJECT_ROOT / "process" / "05.train_models.py"),
@@ -100,7 +87,6 @@ def main() -> None:
     # fold_5 모델 사용
     model_json = models_dir / "fold_5" / "xgb_model.json"
     if not model_json.exists():
-        # 폴드명은 1부터 시작하므로 fold_1이 있을 수도 있음 → 가장 마지막 폴드를 선택
         folds = sorted(models_dir.glob("fold_*"))
         if not folds:
             raise FileNotFoundError("CV 결과 모델을 찾지 못했습니다 (models/fold_*/xgb_model.json)")

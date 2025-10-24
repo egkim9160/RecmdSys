@@ -16,7 +16,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import GroupKFold, StratifiedKFold, train_test_split
+from sklearn.model_selection import GroupKFold, StratifiedKFold, KFold, train_test_split
 
 # Optional dependency for Bayesian optimization
 try:
@@ -67,23 +67,26 @@ def load_dataset(csv_path: str) -> pd.DataFrame:
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
-    # Drop rows with any missing among features or label
-    df = df.dropna(subset=["applied"] + FEATURE_COLUMNS).copy()
-    # Ensure correct dtypes
+
+    # Ensure correct dtypes for features and fill missing with 0 (robust to sparse features like similarity)
     for c in FEATURE_COLUMNS:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=FEATURE_COLUMNS).copy()
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+    # Handle label: coerce to numeric, drop only if label is missing
+    df["applied"] = pd.to_numeric(df["applied"], errors="coerce")
+    df = df.dropna(subset=["applied"]).copy()
     df["applied"] = df["applied"].astype(int)
     return df
 
 
 def stratified_split(df: pd.DataFrame, test_size: float, seed: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # Split DataFrame directly with stratification on label
+    # Split DataFrame; use stratification only when there are at least two classes
+    stratify_target = df["applied"] if df["applied"].nunique() >= 2 else None
     train_df, valid_df = train_test_split(
         df,
         test_size=test_size,
         random_state=seed,
-        stratify=df["applied"],
+        stratify=stratify_target,
     )
     return train_df.reset_index(drop=True), valid_df.reset_index(drop=True)
 
@@ -547,13 +550,23 @@ def run_kfold(df: pd.DataFrame, args: argparse.Namespace) -> None:
     X = df[FEATURE_COLUMNS]
     y = df["applied"].values
 
+    if y.size == 0:
+        raise ValueError(
+            "Empty dataset after loading. Check input CSV and feature NaNs (features are now filled with 0)."
+        )
+
     if args.group_by_doctor:
         groups = df["doctor_id"].values
         splitter = GroupKFold(n_splits=args.cv_folds)
         splits = splitter.split(X, y, groups=groups)
     else:
-        splitter = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=args.random_seed)
-        splits = splitter.split(X, y)
+        # If only one class exists, fall back to KFold (non-stratified)
+        if np.unique(y).size >= 2:
+            splitter = StratifiedKFold(n_splits=args.cv_folds, shuffle=True, random_state=args.random_seed)
+            splits = splitter.split(X, y)
+        else:
+            splitter = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.random_seed)
+            splits = splitter.split(X)
 
     all_metrics = {"xgb": [], "lgbm": [], "logi": []}
     fold_idx = 0

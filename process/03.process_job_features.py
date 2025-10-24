@@ -496,6 +496,8 @@ def main() -> None:
                 job_texts.append(t)
                 job_indices.append(i)
     emb_client = None if args.no_embed else get_embedding_client()
+    if args.verbose:
+        print(f"[EMBED] client={'on' if emb_client is not None else 'off'} model={args.embed_model} batch={args.embed_batch}")
     emb_vecs = _batch_embed_texts(emb_client, job_texts, model=args.embed_model, batch_size=max(1, int(args.embed_batch))) if not args.no_embed else []
 
     df["JOB_EMB_4096"] = pd.NA
