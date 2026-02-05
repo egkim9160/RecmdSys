@@ -484,6 +484,69 @@ def main() -> None:
         job_is_career_irrelevant = [1] * len(df)
 
     # 출력 DF 구성
+    # SERVICE_TYPE 원핫 인코딩 (SERVICE_1/2/3/9) + 7/8 → 2 매핑, 6은 학습 제외용 표시
+    svc = df.get("SERVICE_TYPE") if "SERVICE_TYPE" in df.columns else None
+    svc1: List[int] = []
+    svc2: List[int] = []
+    svc3: List[int] = []
+    svc9: List[int] = []
+    svc_orig_labels: List[str] = []
+    svc_mapped_labels: List[str] = []
+
+    def _parse_service_code_any(x: Any) -> Optional[int]:
+        # 숫자/문자 혼합 입력에서 서비스 코드 정수 추출
+        try:
+            if x is None:
+                return None
+            if isinstance(x, (int,)):
+                return int(x)
+            if isinstance(x, float):
+                import math as _math
+                return None if _math.isnan(x) else int(x)
+            s = str(x).strip()
+            if not s:
+                return None
+            # 우선 "SERVICE_7", "SERVICE7" 형태 처리
+            m = re.search(r"SERVICE[_ ]?(\d+)", s, flags=re.IGNORECASE)
+            if m:
+                return int(m.group(1))
+            # 숫자만 주어진 경우
+            m2 = re.search(r"(\d+)", s)
+            if m2:
+                return int(m2.group(1))
+            return None
+        except Exception:
+            return None
+
+    if svc is not None:
+        for v in svc:
+            orig_code = _parse_service_code_any(v)
+            orig_label = f"SERVICE_{orig_code}" if isinstance(orig_code, int) else (str(v).strip() if v is not None else "")
+
+            # 매핑 규칙: 7/8 → 2, 6 → 제외(원핫 전부 0), 1/2/3/9 유지
+            mapped_code: Optional[int]
+            if orig_code in (7, 8):
+                mapped_code = 2
+            elif orig_code == 6:
+                mapped_code = None
+            elif orig_code in (1, 2, 3, 9):
+                mapped_code = orig_code
+            else:
+                mapped_code = None
+
+            svc1.append(1 if mapped_code == 1 else 0)
+            svc2.append(1 if mapped_code == 2 else 0)
+            svc3.append(1 if mapped_code == 3 else 0)
+            svc9.append(1 if mapped_code == 9 else 0)
+            svc_orig_labels.append(orig_label)
+            svc_mapped_labels.append(f"SERVICE_{mapped_code}" if isinstance(mapped_code, int) else "")
+    else:
+        svc1 = [0] * len(df)
+        svc2 = [0] * len(df)
+        svc3 = [0] * len(df)
+        svc9 = [0] * len(df)
+        svc_orig_labels = [""] * len(df)
+        svc_mapped_labels = [""] * len(df)
     # TITLE + CONTENT 임베딩
     job_texts = []
     job_indices = []
@@ -520,6 +583,18 @@ def main() -> None:
         "JOB_MIN_CAREER_YEARS": job_min_career_years,
         "JOB_MAX_CAREER_YEARS": job_max_career_years,
         "JOB_IS_CAREER_IRRELEVANT": job_is_career_irrelevant,
+        # SERVICE_TYPE one-hot
+        "SERVICE_1": svc1,
+        "SERVICE_2": svc2,
+        "SERVICE_3": svc3,
+        "SERVICE_9": svc9,
+        # 원본/매핑 서비스 라벨(학습 제외/디버깅용)
+        "SERVICE_ORIG": svc_orig_labels,
+        "SERVICE_MAPPED": svc_mapped_labels,
+        # 공고 초대유형 문자열 (사용자 매칭용)
+        "INVITE_TYPE": df.get("INVITE_TYPE"),
+        # 조직 타입(CODE_NAME)
+        "R_ORG_TYPE": df.get("R_ORG_TYPE"),
     })
 
     out_csv = os.path.join(out_dir, "job_training_view.csv")

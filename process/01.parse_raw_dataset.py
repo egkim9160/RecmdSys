@@ -68,7 +68,7 @@ BaseJobs AS (
         J.NIGHT_WORK_FLAG, J.NIGHT_PAY_FLAG, J.WEEKEND_WORK_FLAG, J.WEEKEND_PAY_FLAG,
         J.MEAL_FLAG, J.HOUSE_FLAG, J.ATTEND_FLAG, J.INSU_FLAG, J.REGULAR_FLAG,
         J.U_ID, J.REG_DATE, J.START_DATE, J.END_DATE, J.EXPIRE_DATE,
-        J.CAREER_TYPE, J.INVITE_TYPE, J.RED_WORK, J.REC_REASON, J.APPLY_TYPE
+        J.CAREER_TYPE, J.INVITE_TYPE, J.RED_WORK, J.REC_REASON, J.APPLY_TYPE, J.SERVICE_TYPE
     FROM CBIZ_RECJOB_BACKUP J
     WHERE J.START_DATE >= '{DATE_START}'
       AND J.END_DATE   <= '{DATE_END}'
@@ -127,17 +127,21 @@ JobWithCM AS (
         CM_CAREER.CODE_NAME AS CAREER_REQ_DESC,
         CM_INVITE.CODE_NAME AS INVITE_TYPE_DESC,
         CM_REASON.CODE_NAME AS REASON_FOR_RECRUITMENT,
-        COALESCE(CM_PAY_NET.CODE_NAME, CM_PAY_GROSS.CODE_NAME, CM_PAY_DAY.CODE_NAME) AS PAY_VIEW
+        COALESCE(CM_PAY_NET.CODE_NAME, CM_PAY_GROSS.CODE_NAME, CM_PAY_DAY.CODE_NAME) AS PAY_VIEW,
+        BJ.SERVICE_TYPE AS SERVICE_TYPE,
+        CM_INV_KBN.CODE_NAME AS INVITE_TYPE
     FROM
         BaseJobs BJ
-        LEFT JOIN RECRUIT_COMPANY RC ON BJ.U_ID = RC.u_id
+        LEFT JOIN medigate.RECRUIT_COMPANY RC ON BJ.U_ID = RC.u_id
         LEFT JOIN SpecialtiesAgg SA ON BJ.BOARD_IDX = SA.BOARD_IDX
         LEFT JOIN ApplyMethodsAgg AMA ON BJ.BOARD_IDX = AMA.BOARD_IDX
         LEFT JOIN CODE_MASTER CM_ORG_TYPE ON RC.org_type = CM_ORG_TYPE.CODE AND CM_ORG_TYPE.KBN = 'RECRUIT_ORG_TYPE_ALL'
+        LEFT JOIN CODE_MASTER CM_ORG_SEARCH ON RC.org_type = CM_ORG_SEARCH.CODE AND CM_ORG_SEARCH.KBN = 'RECRUIT_ORG_TYPE_SEARCH'
         LEFT JOIN CODE_MASTER CM_ZON ON RC.hop_loc_code = CM_ZON.CODE AND CM_ZON.KBN = 'ZON'
         LEFT JOIN CODE_MASTER CM_SGG ON RC.hop_city_code = CM_SGG.CODE AND CM_SGG.KBN = 'SGG'
         LEFT JOIN CODE_MASTER CM_CAREER ON BJ.CAREER_TYPE = CM_CAREER.CODE AND CM_CAREER.KBN = 'RECRUIT_CAREER_RANGE_JOB'
         LEFT JOIN CODE_MASTER CM_INVITE ON BJ.INVITE_TYPE = CM_INVITE.CODE AND CM_INVITE.KBN = 'RECRUIT_INVITE_TYPE_SEARCH'
+        LEFT JOIN CODE_MASTER CM_INV_KBN ON BJ.INVITE_TYPE = CM_INV_KBN.CODE AND CM_INV_KBN.KBN = 'RECRUIT_INVITE'
         LEFT JOIN CODE_MASTER CM_REASON ON BJ.REC_REASON = CM_REASON.CODE AND CM_REASON.KBN = 'RECRUIT_REC_REASON'
         LEFT JOIN CODE_MASTER CM_PAY_NET   ON BJ.PAY = CM_PAY_NET.CODE   AND BJ.PAY_TYPE = 5 AND CM_PAY_NET.KBN = 'RECRUIT_NET_PAY_TYPE'
         LEFT JOIN CODE_MASTER CM_PAY_GROSS ON BJ.PAY = CM_PAY_GROSS.CODE AND BJ.PAY_TYPE = 6 AND CM_PAY_GROSS.KBN = 'RECRUIT_GROSS_PAY_TYPE'
@@ -155,8 +159,12 @@ JobDetailsCalculated AS (
             ELSE NULL
         END AS REGION,
         JW.ADDRESS, JW.START_DATE, JW.END_DATE, JW.EXPIRE_DATE,
-        JW.CAREER_REQ_DESC, JW.INVITE_TYPE_DESC, JW.REASON_FOR_RECRUITMENT
+        JW.CAREER_REQ_DESC, JW.INVITE_TYPE_DESC, JW.REASON_FOR_RECRUITMENT,
+        JW.SERVICE_TYPE, JW.INVITE_TYPE,
+        CM_ORG_SEARCH.CODE_NAME AS R_ORG_TYPE
     FROM JobWithCM JW
+    LEFT JOIN medigate.RECRUIT_COMPANY RC ON JW.BOARD_IDX = JW.BOARD_IDX AND JW.ORGANIZATION_NAME = RC.org_name
+    LEFT JOIN CODE_MASTER CM_ORG_SEARCH ON RC.org_type = CM_ORG_SEARCH.CODE AND CM_ORG_SEARCH.KBN = 'RECRUIT_ORG_TYPE_SEARCH'
 )
 SELECT * FROM JobDetailsCalculated;
 """
@@ -276,6 +284,19 @@ def fetch_dataframe(conn: MySQLConnection, query: str, params: tuple = None) -> 
     return pd.read_sql(query, conn, params=params)
 
 
+def _column_exists(conn: MySQLConnection, table_name: str, column_name: str) -> bool:
+    sql = """
+SELECT COUNT(*) AS cnt
+FROM information_schema.columns
+WHERE table_schema = DATABASE() AND table_name = %s AND column_name = %s
+"""
+    try:
+        df = pd.read_sql(sql, conn, params=(table_name, column_name))
+        return bool(df.iloc[0, 0] > 0)
+    except Exception:
+        return False
+
+
 def fetch_user_side_features(conn: MySQLConnection, user_ids: List[int], chunk_size: int = 500) -> pd.DataFrame:
     """
     사용자별 feature를 개별 조회 대신 벌크 SQL(CTE + IN 절)로 조회하여 왕복 횟수를 줄입니다.
@@ -303,6 +324,9 @@ def fetch_user_side_features(conn: MySQLConnection, user_ids: List[int], chunk_s
     for start in range(0, len(user_ids), chunk_size):
         chunk = user_ids[start:start + chunk_size]
         placeholders = ",".join(["%s"] * len(chunk))
+        has_user_org_code = _column_exists(conn, 'USER_DETAIL', 'U_HOSPITAL_GROUP_CODE')
+        org_code_expr = 'ud2.U_HOSPITAL_GROUP_CODE' if has_user_org_code else 'NULL'
+
         bulk_query = f"""
 WITH DefaultResume AS (
     SELECT RESUME_IDX, U_ID
@@ -355,10 +379,16 @@ ResumeAddr AS (
     FROM DefaultResume dr_sub
     LEFT JOIN RESUME r ON r.RESUME_IDX = dr_sub.RESUME_IDX
 ),
+UserTable AS (
+    SELECT ud2.U_ID, {org_code_expr} AS U_HOSPITAL_GROUP_CODE
+    FROM USER_DETAIL ud2
+    WHERE ud2.U_ID IN ({placeholders})
+),
 UserDetail AS (
     SELECT ud.U_ID,
            ud.U_HOME_ADDR,
-           ud.U_OFFICE_ADDR
+           ud.U_OFFICE_ADDR,
+           ud.U_WORK_TYPE_1
     FROM USER_DETAIL ud
     WHERE ud.U_ID IN ({placeholders})
 )
@@ -375,6 +405,8 @@ SELECT
     ra.R_ADDRESS,
     ud.U_HOME_ADDR,
     ud.U_OFFICE_ADDR,
+    cm_wtp.CODE_NAME AS U_WORK_TYPE,
+    cm_hos.CODE_NAME AS U_ORG_TYPE,
     CASE
         WHEN cm.total_months IS NULL THEN '경력 없음'
         WHEN cm.total_months < 12 THEN '1년 미만'
@@ -390,10 +422,13 @@ LEFT JOIN HopeData hd ON dr.U_ID = hd.U_ID
 LEFT JOIN PreferencesData pd ON dr.U_ID = pd.U_ID
 LEFT JOIN CareerMonths cm ON dr.U_ID = cm.U_ID
 LEFT JOIN ResumeAddr ra ON dr.U_ID = ra.U_ID
-LEFT JOIN UserDetail ud ON dr.U_ID = ud.U_ID;
+LEFT JOIN UserDetail ud ON dr.U_ID = ud.U_ID
+LEFT JOIN UserTable ut ON dr.U_ID = ut.U_ID
+LEFT JOIN CODE_MASTER cm_wtp ON cm_wtp.KBN = 'WTP' AND cm_wtp.CODE = ud.U_WORK_TYPE_1
+LEFT JOIN CODE_MASTER cm_hos ON cm_hos.KBN = 'HOS' AND cm_hos.CODE = ut.U_HOSPITAL_GROUP_CODE;
 """
 
-        params = tuple(chunk) + tuple(chunk) + tuple(chunk)
+        params = tuple(chunk) + tuple(chunk) + tuple(chunk) + tuple(chunk)
         try:
             df_chunk = pd.read_sql(bulk_query, conn, params=params)
         except Exception as e:
@@ -421,6 +456,157 @@ LEFT JOIN UserDetail ud ON dr.U_ID = ud.U_ID;
     full_df = all_users_df.merge(combined.drop_duplicates(subset=["U_ID"]), on="U_ID", how="left")
     return full_df
 
+
+def fetch_user_side_features_for_applied(conn: MySQLConnection) -> pd.DataFrame:
+    """
+    기간 조건과 온라인 지원 유형(MG/CF/FF)을 만족하는 공고에 실제 지원한 사용자 전체를
+    CTE로 필터링하여 조인만으로 사용자 측 feature를 한 번에 조회합니다.
+    IN 절과 대량 파라미터 바인딩을 피해서 드라이버/서버 제한에 걸리지 않도록 합니다.
+    """
+    has_user_org_code = _column_exists(conn, 'USER_DETAIL', 'U_HOSPITAL_GROUP_CODE')
+    org_code_expr = 'ud2.U_HOSPITAL_GROUP_CODE' if has_user_org_code else 'NULL'
+
+    query = f"""
+WITH AppliedJobs AS (
+    SELECT BJ.BOARD_IDX
+    FROM CBIZ_RECJOB_BACKUP BJ
+    WHERE BJ.START_DATE >= '{DATE_START}'
+      AND BJ.END_DATE   <= '{DATE_END}'
+      AND BJ.APPROVAL_FLAG = 'Y'
+      AND BJ.DISPLAY_FLAG  = 'Y'
+      AND BJ.DEL_FLAG      = 'N'
+      AND (
+        FIND_IN_SET('MG', REPLACE(BJ.APPLY_TYPE, ' ', '')) > 0 OR
+        FIND_IN_SET('CF', REPLACE(BJ.APPLY_TYPE, ' ', '')) > 0 OR
+        FIND_IN_SET('FF', REPLACE(BJ.APPLY_TYPE, ' ', '')) > 0
+      )
+),
+AppliedUsers AS (
+    SELECT DISTINCT RA.U_ID
+    FROM RECRUIT_APPLY RA
+    JOIN AppliedJobs SJ ON RA.BOARD_IDX = SJ.BOARD_IDX
+),
+DefaultResume AS (
+    SELECT RESUME_IDX, U_ID
+    FROM RESUME
+    WHERE default_flag = 'Y' AND U_ID IN (SELECT U_ID FROM AppliedUsers)
+),
+CareerMonths AS (
+    SELECT dr.U_ID,
+           SUM(
+               PERIOD_DIFF(
+                 DATE_FORMAT(STR_TO_DATE(CONCAT(IFNULL(NULLIF(rc.to_date, ''), DATE_FORMAT(CURDATE(), '%Y.%m')), '.01'), '%Y.%m.%d'), '%Y%m'),
+                 DATE_FORMAT(STR_TO_DATE(CONCAT(rc.from_date, '.01'), '%Y.%m.%d'), '%Y%m')
+               ) + 1
+           ) AS total_months
+    FROM RESUME_CAREER rc
+    INNER JOIN DefaultResume dr ON rc.RESUME_IDX = dr.RESUME_IDX
+    WHERE rc.from_date IS NOT NULL AND rc.from_date != ''
+    GROUP BY dr.U_ID
+),
+HopeData AS (
+    SELECT dr_sub.U_ID,
+           GROUP_CONCAT(DISTINCT CASE WHEN rm.MAP_TYPE = 'IVT' AND cm.KBN = 'IVT' THEN cm.CODE_NAME END SEPARATOR ', ') AS HOPE_INVITE_TYPES,
+           GROUP_CONCAT(DISTINCT CASE WHEN rm.MAP_TYPE = 'SPC' AND cm.KBN = 'SPC' THEN cm.CODE_NAME END SEPARATOR ', ') AS HOPE_SPECIALTIES,
+           GROUP_CONCAT(DISTINCT CASE WHEN rm.MAP_TYPE = 'LOC' AND cm.KBN IN ('ZON', 'SGG') THEN cm.CODE_NAME END SEPARATOR ', ') AS HOPE_REGION
+    FROM DefaultResume dr_sub
+    LEFT JOIN RESUME_MAP rm ON dr_sub.RESUME_IDX = rm.RESUME_IDX
+    LEFT JOIN CODE_MASTER cm ON rm.MAP_CODE = cm.CODE
+    GROUP BY dr_sub.U_ID
+),
+PreferencesData AS (
+    SELECT crm.U_ID,
+           GROUP_CONCAT(DISTINCT CASE WHEN cm.KBN = 'IVT' THEN cm.CODE_NAME END ORDER BY cm.CODE_NAME SEPARATOR ', ') AS MATCH_INVITE_TYPES,
+           GROUP_CONCAT(DISTINCT CASE WHEN cm.KBN = 'SPC' THEN cm.CODE_NAME END ORDER BY cm.CODE_NAME SEPARATOR ', ') AS MATCH_SPECIALTIES,
+           GROUP_CONCAT(DISTINCT CASE WHEN cm.KBN = 'ZON' THEN cm.CODE_NAME END ORDER BY cm.CODE_NAME SEPARATOR ', ') AS MATCH_LOC_ZONE_NAMES,
+           GROUP_CONCAT(DISTINCT CASE WHEN cm.KBN = 'SGG' THEN cm.CODE_NAME END ORDER BY cm.CODE_NAME SEPARATOR ', ') AS MATCH_LOC_CITY_NAMES,
+           GROUP_CONCAT(DISTINCT CASE WHEN cm.KBN = 'RECRUIT_ORG_TYPE_SEARCH' THEN cm.CODE_NAME END ORDER BY cm.CODE_NAME SEPARATOR ', ') AS MATCH_ORGANIZATION_TYPES
+    FROM CBIZ_REC_MATCHING crm
+    JOIN AppliedUsers au ON crm.U_ID = au.U_ID
+    LEFT JOIN CODE_MASTER cm ON
+        (cm.KBN = 'IVT' AND FIND_IN_SET(cm.CODE, crm.IVT_CODE) > 0) OR
+        (cm.KBN = 'SPC' AND FIND_IN_SET(cm.CODE, crm.SPC_CODE) > 0) OR
+        (cm.KBN = 'ZON' AND FIND_IN_SET(cm.CODE, crm.LOC_CODE) > 0) OR
+        (cm.KBN = 'SGG' AND FIND_IN_SET(cm.CODE, crm.CITY_CODE) > 0) OR
+        (cm.KBN = 'RECRUIT_ORG_TYPE_SEARCH' AND FIND_IN_SET(cm.CODE, crm.ORG_CODE) > 0)
+    GROUP BY crm.U_ID
+),
+ResumeAddr AS (
+    SELECT dr_sub.U_ID,
+           r.address AS R_ADDRESS
+    FROM DefaultResume dr_sub
+    LEFT JOIN RESUME r ON r.RESUME_IDX = dr_sub.RESUME_IDX
+),
+UserTable AS (
+    SELECT ud2.U_ID, {org_code_expr} AS U_HOSPITAL_GROUP_CODE
+    FROM USER_DETAIL ud2
+    JOIN AppliedUsers au ON ud2.U_ID = au.U_ID
+),
+UserDetail AS (
+    SELECT ud.U_ID,
+           ud.U_HOME_ADDR,
+           ud.U_OFFICE_ADDR,
+           ud.U_WORK_TYPE_1
+    FROM USER_DETAIL ud
+    JOIN AppliedUsers au ON ud.U_ID = au.U_ID
+)
+SELECT
+    au.U_ID,
+    hd.HOPE_INVITE_TYPES,
+    hd.HOPE_SPECIALTIES,
+    hd.HOPE_REGION,
+    pd.MATCH_INVITE_TYPES,
+    pd.MATCH_SPECIALTIES,
+    pd.MATCH_LOC_ZONE_NAMES,
+    pd.MATCH_LOC_CITY_NAMES,
+    pd.MATCH_ORGANIZATION_TYPES,
+    ra.R_ADDRESS,
+    ud.U_HOME_ADDR,
+    ud.U_OFFICE_ADDR,
+    cm_wtp.CODE_NAME AS U_WORK_TYPE,
+    cm_hos.CODE_NAME AS U_ORG_TYPE,
+    CASE
+        WHEN cm.total_months IS NULL THEN '경력 없음'
+        WHEN cm.total_months < 12 THEN '1년 미만'
+        WHEN cm.total_months < 36 THEN '1~2년'
+        WHEN cm.total_months < 60 THEN '3~4년'
+        WHEN cm.total_months < 84 THEN '5~6년'
+        WHEN cm.total_months < 108 THEN '7~8년'
+        WHEN cm.total_months < 120 THEN '9~10년'
+        ELSE '10년 이상'
+    END AS CAREER_YEARS
+FROM AppliedUsers au
+LEFT JOIN DefaultResume dr ON dr.U_ID = au.U_ID
+LEFT JOIN HopeData hd ON au.U_ID = hd.U_ID
+LEFT JOIN PreferencesData pd ON au.U_ID = pd.U_ID
+LEFT JOIN CareerMonths cm ON au.U_ID = cm.U_ID
+LEFT JOIN ResumeAddr ra ON au.U_ID = ra.U_ID
+LEFT JOIN UserDetail ud ON au.U_ID = ud.U_ID
+LEFT JOIN UserTable ut ON au.U_ID = ut.U_ID
+LEFT JOIN CODE_MASTER cm_wtp ON cm_wtp.KBN = 'WTP' AND cm_wtp.CODE = ud.U_WORK_TYPE_1
+LEFT JOIN CODE_MASTER cm_hos ON cm_hos.KBN = 'HOS' AND cm_hos.CODE = ut.U_HOSPITAL_GROUP_CODE;
+"""
+    try:
+        return pd.read_sql(query, conn)
+    except Exception as e:
+        print(f"[warn] 사용자 전체 feature 조회 실패: {e}")
+        return pd.DataFrame(columns=[
+            "U_ID",
+            "HOPE_INVITE_TYPES",
+            "HOPE_SPECIALTIES",
+            "HOPE_REGION",
+            "MATCH_INVITE_TYPES",
+            "MATCH_SPECIALTIES",
+            "MATCH_LOC_ZONE_NAMES",
+            "MATCH_LOC_CITY_NAMES",
+            "MATCH_ORGANIZATION_TYPES",
+            "R_ADDRESS",
+            "U_HOME_ADDR",
+            "U_OFFICE_ADDR",
+            "U_WORK_TYPE",
+            "U_ORG_TYPE",
+            "CAREER_YEARS",
+        ])
 
 def clean_html_and_get_urls(html_string: str) -> Tuple[str, List[str]]:
     """HTML에서 텍스트를 추출하고 태그를 제거해 문장 단위로 정리합니다. (이미지 URL 미사용)"""
@@ -607,16 +793,13 @@ def main():
             if "CONTENT" in jobs_df.columns:
                 safe_series = jobs_df["CONTENT"].fillna("").astype(str)
                 job_texts: List[str] = []
-                job_img_urls: List[str] = []
                 for html_str in safe_series.tolist():
                     text, urls = clean_html_and_get_urls(html_str)
                     # CONTENT는 반드시 한 줄로: 줄바꿈 제거 후 공백 정규화
                     one_line_text = re.sub(r'\s+', ' ', text.replace('\n', ' ')).strip()
                     job_texts.append(one_line_text)
-                    # 이미지 URL은 더 이상 사용하지 않음
                 # CONTENT를 정제 텍스트로 덮어쓰기 (원본은 저장하지 않음)
                 jobs_df["CONTENT"] = job_texts
-                jobs_df["JOB_IMAGE_URLS"] = job_img_urls
             else:
                 print("[warn] jobs_df에 CONTENT 컬럼이 없어 정제를 건너뜁니다.")
             print(f"[time] 1-a) CONTENT 정제: {time.time() - t1a:.2f}s")
@@ -656,7 +839,8 @@ def main():
         return
 
     print("3) 사용자 ID 수집 및 BigQuery 전문과/세부전문과 조회...")
-    user_ids = applied_df["U_ID"].dropna().unique().tolist()
+    user_ids_series = applied_df["U_ID"].astype(str).str.strip()
+    user_ids = user_ids_series[user_ids_series > ""].unique().tolist()
     print(f"   unique user 수: {len(user_ids)}명")
     # 3-1) BigQuery 조회 먼저 수행
     try:

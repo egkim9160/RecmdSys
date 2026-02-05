@@ -320,6 +320,8 @@ def main():
         "CAREER_YEARS",
         "BOARD_IDX",
         "RESUME_EMB_4096",
+        "U_WORK_TYPE",
+        "U_ORG_TYPE",
     ]
     # Ensure missing columns exist in included_df
     for c in keep_cols:

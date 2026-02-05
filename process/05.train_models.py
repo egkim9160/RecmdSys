@@ -35,6 +35,13 @@ FEATURE_COLUMNS = [
     "career_match",
     "career_gap",
     "is_career_irrelevant",
+    # 서비스 타입 및 작업유형 매칭
+    "SERVICE_1",
+    "SERVICE_2",
+    "SERVICE_3",
+    "SERVICE_9",
+    "WORK_TYPE",
+    "ORG_MATCHING",
     "similarity"
 ]
 
@@ -130,6 +137,7 @@ def train_xgboost(
         X_train,
         y_train,
         eval_set=[(X_valid, y_valid)],
+        verbose=False,  # suppress stdout; we'll save eval history to file instead
     )
 
     y_prob = model.predict_proba(X_valid)[:, 1]
@@ -311,6 +319,51 @@ def evaluate_predictions(y_true: np.ndarray, y_prob: np.ndarray) -> Dict[str, fl
     return metrics
 
 
+def save_xgb_eval_history(out_dir: str, model_name: str, model: object) -> None:
+    """Save XGBoost eval history (per-iteration metrics) to CSV under out_dir.
+
+    The file is named as "{model_name}_training_log.csv".
+    If eval history is unavailable, this function is a no-op.
+    """
+    try:
+        # XGBClassifier exposes evals_result() after fit when eval_set is provided
+        res = model.evals_result()  # type: ignore[attr-defined]
+    except Exception:
+        return
+    if not isinstance(res, dict) or not res:
+        return
+
+    # Flatten: columns like "validation_0_logloss", "validation_0_auc"
+    # Determine max num rounds
+    max_len = 0
+    for eval_name, metrics_dict in res.items():
+        for metric_name, values in metrics_dict.items():
+            try:
+                max_len = max(max_len, len(values))
+            except Exception:
+                pass
+    if max_len <= 0:
+        return
+
+    data: Dict[str, list] = {"iter": list(range(max_len))}
+    for eval_name, metrics_dict in res.items():
+        for metric_name, values in metrics_dict.items():
+            col = f"{eval_name}_{metric_name}"
+            try:
+                arr = list(values)
+            except Exception:
+                arr = []
+            if len(arr) < max_len:
+                arr = arr + [None] * (max_len - len(arr))
+            data[col] = arr
+
+    try:
+        df_hist = pd.DataFrame(data)
+        out_path = os.path.join(out_dir, f"{model_name}_training_log.csv")
+        df_hist.to_csv(out_path, index=False)
+    except Exception:
+        pass
+
 def save_reports(
     out_dir: str,
     model_name: str,
@@ -391,7 +444,7 @@ def main() -> None:
     parser.add_argument("--test_size", type=float, default=0.2)
     parser.add_argument("--random_seed", type=int, default=42)
     parser.add_argument("--top_k_importances", type=int, default=20)
-    parser.add_argument("--cv_folds", type=int, default=5, help="0이면 홀드아웃, >0이면 K-fold (기본 5)")
+    parser.add_argument("--cv_folds", type=int, default=0, help="0이면 홀드아웃(및 전체 학습), >0이면 K-fold (기본 0)")
     parser.add_argument("--group_by_doctor", action="store_true", help="doctor_id 기준 그룹 분할")
 
     # 하이퍼파라미터 CLI 인자 제거: 기본 상수와 JSON 병합 사용
@@ -433,8 +486,14 @@ def main() -> None:
     if args.tune:
         if optuna is None:
             raise RuntimeError("optuna가 설치되어 있지 않습니다.")
+        # 튜닝 먼저 수행 (xgb/lgbm 모두 가능)
         run_tuning(df, args, args.out_dir)
-        return
+        # 튜닝 이후에도 cv_folds가 지정된 경우, fold 결과 저장을 위해 K-Fold 실행
+        # (기존에는 여기서 return 하여 fold_* 디렉토리가 생성되지 않았음)
+        if args.cv_folds and args.cv_folds > 0:
+            run_kfold(df, args)
+            return
+        # cv_folds가 없으면 아래 홀드아웃 학습으로 진행
     if args.cv_folds and args.cv_folds > 0:
         run_kfold(df, args)
         return
@@ -484,6 +543,8 @@ def main() -> None:
             model_params=xgb_params,
         )
         y_prob = xgb_model.predict_proba(X_valid)[:, 1]
+        # Save training log under out_dir
+        save_xgb_eval_history(run_dir, "xgb", xgb_model)
         save_reports(run_dir, "xgb", xgb_model, xgb_metrics, xgb_imps, y_valid, y_prob)
 
         # Save top-k summary
@@ -538,6 +599,84 @@ def main() -> None:
         except Exception:
             y_prob = logi_model.predict_proba(X_valid)[:, 1]
         save_reports(run_dir, "logi", logi_model, logi_metrics, logi_coefs, y_valid, y_prob)
+
+        # 전체 데이터로 로지스틱 추가 학습 및 저장 (기본 수행)
+        X_full_df = df[FEATURE_COLUMNS].copy()
+        y_full = df["applied"].values
+        # 동일 함수 재사용: train/valid 모두 전체 데이터로 설정하여 보고서 생성
+        full_train_df = df.copy()
+        full_valid_df = df.copy()
+        logi_full_model, logi_full_metrics, logi_full_coefs = train_logistic(
+            full_train_df,
+            full_valid_df,
+            seed=args.random_seed,
+            model_params={},
+        )
+        # 확률 산출
+        try:
+            import statsmodels.api as sm  # type: ignore
+            X_full_sm = sm.add_constant(X_full_df, has_constant="add")
+            y_full_prob = np.asarray(logi_full_model.predict(X_full_sm), dtype=float)
+        except Exception:
+            y_full_prob = logi_full_model.predict_proba(X_full_df.values)[:, 1]
+
+        # 전체 데이터 기반 저장: 파일명 접두사 logi_full
+        save_reports(run_dir, "logi_full", logi_full_model, logi_full_metrics, logi_full_coefs, y_full, y_full_prob)
+        # 모델 아티팩트(pkl)도 저장
+        try:
+            import joblib as _joblib  # type: ignore
+            _joblib.dump(logi_full_model, os.path.join(run_dir, "logi_full_model.pkl"))
+        except Exception:
+            pass
+
+    # XGBoost 전체 데이터 학습 및 저장 (튜닝 파라미터가 있으면 적용)
+    if args.models in ("all", "xgb"):
+        X_all = df[FEATURE_COLUMNS].values
+        y_all = df["applied"].values
+        xgb_full_params = dict(DEFAULT_XGB_PARAMS)
+        if tuned_xgb:
+            allowed_keys = {
+                "n_estimators",
+                "learning_rate",
+                "max_depth",
+                "subsample",
+                "colsample_bytree",
+                "min_child_weight",
+                "reg_lambda",
+                "reg_alpha",
+            }
+            xgb_full_params.update({k: v for k, v in tuned_xgb.items() if k in allowed_keys})
+        # scale_pos_weight on full data
+        spw_full = compute_class_weights(y_all)
+        xgb_full_params.update({
+            "scale_pos_weight": spw_full,
+            "use_gpu": args.use_gpu,
+            "gpu_id": args.gpu_id,
+        })
+
+        from xgboost import XGBClassifier
+        full_model = XGBClassifier(
+            objective="binary:logistic",
+            eval_metric=["logloss", "auc"],
+            tree_method="hist",
+            random_state=args.random_seed,
+            n_jobs=max(1, os.cpu_count() or 1),
+            **{k: v for k, v in xgb_full_params.items() if k not in ["use_gpu", "gpu_id"]},
+        )
+        # train with eval on training set to produce log
+        full_model.fit(X_all, y_all, eval_set=[(X_all, y_all)], verbose=False)
+        try:
+            full_model.get_booster().save_model(os.path.join(run_dir, "xgb_full_model.json"))
+        except Exception:
+            pass
+        # save training log
+        save_xgb_eval_history(run_dir, "xgb_full", full_model)
+        # also save features info
+        try:
+            with open(os.path.join(run_dir, "data_info_full.json"), "w") as f:
+                json.dump({"features": FEATURE_COLUMNS, "rows": int(len(df))}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     print(run_dir)
 
@@ -618,6 +757,8 @@ def run_kfold(df: pd.DataFrame, args: argparse.Namespace) -> None:
                 model_params=xgb_params,
             )
             y_prob = xgb_model.predict_proba(X_valid)[:, 1]
+            # Save training log under fold dir
+            save_xgb_eval_history(fold_dir, "xgb", xgb_model)
             save_reports(fold_dir, "xgb", xgb_model, xgb_metrics, xgb_imps, y_valid, y_prob)
             all_metrics["xgb"].append(xgb_metrics)
 

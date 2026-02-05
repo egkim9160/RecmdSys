@@ -107,6 +107,28 @@ def build_training_pairs(
     if "JOB_IS_CAREER_IRRELEVANT" not in jobs_filtered.columns:
         jobs_filtered["JOB_IS_CAREER_IRRELEVANT"] = 1
 
+    # SERVICE_TYPE one-hot 기본값 채우기 (SERVICE_1/2/3/9)
+    for c in ["SERVICE_1", "SERVICE_2", "SERVICE_3", "SERVICE_9"]:
+        if c not in jobs_filtered.columns:
+            jobs_filtered[c] = 0
+        jobs_filtered[c] = pd.to_numeric(jobs_filtered[c], errors="coerce").fillna(0).astype(int)
+
+    # 공고 초대유형 문자열 (INVITE_TYPE) 기본값
+    if "INVITE_TYPE" not in jobs_filtered.columns:
+        jobs_filtered["INVITE_TYPE"] = None
+
+    # 공고 조직 타입(R_ORG_TYPE) 기본값
+    if "R_ORG_TYPE" not in jobs_filtered.columns:
+        jobs_filtered["R_ORG_TYPE"] = None
+
+    # SERVICE_6 공고 학습제외: process(03)에서 SERVICE_ORIG 보존 → 여기서 필터링
+    # SERVICE_ORIG 값이 "SERVICE_6"인 공고는 제외
+    try:
+        if "SERVICE_ORIG" in jobs_filtered.columns:
+            jobs_filtered = jobs_filtered[jobs_filtered["SERVICE_ORIG"].astype(str).str.strip() != "SERVICE_6"].copy()
+    except Exception:
+        pass
+
     board_to_job = jobs_filtered.set_index("BOARD_IDX")[
         [
             "SPECIALTIES_SET",
@@ -116,6 +138,12 @@ def build_training_pairs(
             "JOB_MIN_CAREER_YEARS",
             "JOB_MAX_CAREER_YEARS",
             "JOB_IS_CAREER_IRRELEVANT",
+            "SERVICE_1",
+            "SERVICE_2",
+            "SERVICE_3",
+            "SERVICE_9",
+            "INVITE_TYPE",
+            "R_ORG_TYPE",
         ]
     ]
 
@@ -190,6 +218,12 @@ def build_training_pairs(
             job_min_career = job_row.get("JOB_MIN_CAREER_YEARS")
             job_max_career = job_row.get("JOB_MAX_CAREER_YEARS")
             job_irrelevant = int(job_row.get("JOB_IS_CAREER_IRRELEVANT", 1))
+            svc_1 = int(job_row.get("SERVICE_1", 0))
+            svc_2 = int(job_row.get("SERVICE_2", 0))
+            svc_3 = int(job_row.get("SERVICE_3", 0))
+            svc_9 = int(job_row.get("SERVICE_9", 0))
+            job_invite_type = str(job_row.get("INVITE_TYPE") or "").strip()
+            job_r_org_type = str(job_row.get("R_ORG_TYPE") or "").strip()
 
             distance_home, distance_office = compute_distances_for_board(
                 home_lat, home_lon, office_lat, office_lon, org_lat, org_lon
@@ -211,6 +245,16 @@ def build_training_pairs(
                 except Exception:
                     sim_val = None
             applied_label = 1 if board_id in applied_set else 0
+
+            # WORK_TYPE: 공고 INVITE_TYPE과 사용자 U_WORK_TYPE 일치 여부
+            u_work_type_raw = u.get("U_WORK_TYPE")
+            u_work_type = str(u_work_type_raw).strip() if u_work_type_raw is not None and not (isinstance(u_work_type_raw, float) and np.isnan(u_work_type_raw)) else ""
+            work_type = 1 if (job_invite_type and u_work_type and (job_invite_type == u_work_type)) else 0
+
+            # ORG_MATCHING: 공고 R_ORG_TYPE과 사용자 U_ORG_TYPE 일치 여부
+            u_org_type_raw = u.get("U_ORG_TYPE")
+            u_org_type = str(u_org_type_raw).strip() if u_org_type_raw is not None and not (isinstance(u_org_type_raw, float) and np.isnan(u_org_type_raw)) else ""
+            org_matching = 1 if (job_r_org_type and u_org_type and (job_r_org_type == u_org_type)) else 0
 
             # -----------------------------
             # 경력 매칭 특성 계산
@@ -267,6 +311,12 @@ def build_training_pairs(
                     "career_gap": int(career_gap),
                     "is_career_irrelevant": int(career_irrelevant),
                     "similarity": sim_val,
+                    "SERVICE_1": svc_1,
+                    "SERVICE_2": svc_2,
+                    "SERVICE_3": svc_3,
+                    "SERVICE_9": svc_9,
+                    "WORK_TYPE": int(work_type),
+                    "ORG_MATCHING": int(org_matching),
                     "applied": int(applied_label),
                 }
             )
@@ -315,6 +365,12 @@ def build_training_pairs(
         "career_match",
         "career_gap",
         "is_career_irrelevant",
+        "SERVICE_1",
+        "SERVICE_2",
+        "SERVICE_3",
+        "SERVICE_9",
+        "WORK_TYPE",
+        "ORG_MATCHING",
         "similarity",
         "applied",
     ]]
