@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Job(공고) raw CSV → processed view 단일 스크립트
+Job(공고) raw CSV → processed view 단일 스크립트 (v2_gemini_embeddings)
 
 포함 기능:
 - 급여 변환(원 단위): Gross 연봉↔Net 월급 계산 로직 내장
-- 공고 뷰 생성: PAY 산출, 지오코딩(ADDRESS → LLM 정제 → REGION), 로그/노트 출력
+- 공고 뷰 생성: PAY 산출, 좌표(RECRUIT_COMPANY 우선 → geocoding fallback), Gemini embedding
+- Gemini embedding-001 (3072d, task_type=SEMANTIC_SIMILARITY, 2000 토큰 초과 시 요약)
 
 입출력:
-- 입력: /SPO/Project/RecSys/data/raw/job_features.csv (기본)
-- 출력: /SPO/Project/RecSys/data/processed/job_features_{FIXED_TS}/job_training_view.csv
+- 입력: job_features.csv
+- 출력: job_training_view.csv
 
 사용 예:
 python process_job_features.py --input /path/to/job_features.csv --out_dir /path/to/processed_dir --limit 1000 --no-llm --concurrency 20 --verbose
@@ -52,6 +53,68 @@ try:
 except Exception as import_err:
     raise RuntimeError(f"Failed to import geocoding module from project module path: {import_err}")
 
+try:
+    from module.db_utils import get_connection as db_get_connection
+except Exception:
+    db_get_connection = None
+
+
+def fetch_recruit_company_coordinates(u_ids: List[str]) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+    """
+    RECRUIT_COMPANY 테이블에서 u_id 기반으로 POS_X, POS_Y 좌표를 조회
+
+    Args:
+        u_ids: u_id 리스트
+
+    Returns:
+        {u_id: (lat, lon)} 딕셔너리 (좌표 없으면 (None, None))
+    """
+    if not u_ids or db_get_connection is None:
+        return {}
+
+    result: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+
+    try:
+        import pandas as _pd
+        conn = db_get_connection()
+
+        # u_id 청크로 분할하여 조회 (IN 절 제한 회피)
+        chunk_size = 500
+        for start in range(0, len(u_ids), chunk_size):
+            chunk = u_ids[start:start + chunk_size]
+            placeholders = ",".join(["%s"] * len(chunk))
+            query = f"""
+                SELECT u_id, POS_X, POS_Y
+                FROM medigate.RECRUIT_COMPANY
+                WHERE u_id IN ({placeholders})
+            """
+            df = _pd.read_sql(query, conn, params=tuple(chunk))
+
+            for _, row in df.iterrows():
+                u_id = str(row.get("u_id", "")).strip()
+                pos_x = row.get("POS_X")
+                pos_y = row.get("POS_Y")
+
+                lat, lon = None, None
+                try:
+                    if pos_x is not None and pos_y is not None:
+                        if not _pd.isna(pos_x) and not _pd.isna(pos_y):
+                            # POS_X = 경도(lon), POS_Y = 위도(lat)
+                            lon = float(pos_x)
+                            lat = float(pos_y)
+                except Exception:
+                    pass
+
+                if u_id:
+                    result[u_id] = (lat, lon)
+
+        conn.close()
+
+    except Exception as e:
+        print(f"[WARN] RECRUIT_COMPANY 좌표 조회 실패: {e}")
+
+    return result
+
 
 def load_environment() -> None:
     # Always load from project root (run_pipeline.py location)
@@ -79,6 +142,12 @@ def get_embedding_client():
 def _batch_embed_texts(client, texts, model: str = "text-embedding-3-large", batch_size: int = 64):
     from module.llm_utils import batch_embed_texts
     return batch_embed_texts(client, texts, model, batch_size)
+
+
+def _batch_embed_texts_gemini(texts, verbose: bool = False, log_interval: int = 100, max_workers: int = 10):
+    """Gemini embedding-001을 사용한 배치 임베딩 (3072d, SEMANTIC_SIMILARITY, 병렬 처리)"""
+    from module.llm_utils import batch_embed_texts_gemini
+    return batch_embed_texts_gemini(texts, task_type="SEMANTIC_SIMILARITY", verbose=verbose, log_interval=log_interval, max_workers=max_workers)
 
 
 def clean_address_with_llm(raw_address: str, client) -> Optional[str]:
@@ -341,6 +410,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log-interval", type=int, default=200, help="진행 로그 출력 간격(건수)")
     p.add_argument("--embed_model", type=str, default="text-embedding-3-large", help="임베딩 모델명(OpenAI 호환)")
     p.add_argument("--embed_batch", type=int, default=64, help="임베딩 배치 크기")
+    p.add_argument("--embed_workers", type=int, default=10, help="임베딩 병렬 처리 워커 수 (Gemini)")
     p.add_argument("--no-embed", action="store_true", help="임베딩 비활성화")
     return p
 
@@ -371,66 +441,93 @@ def main() -> None:
         if args.verbose and (i % max(1, args.log_interval) == 0 or i == total):
             print(f"[PAY] progress {i}/{total} elapsed={time.time() - t0:.1f}s")
 
-    # 지오코딩 (ADDRESS -> LLM 정제 -> REGION) - asyncio 비동기 처리
-    async def run_geocoding(rows: List[pd.Series]) -> Tuple[List[Optional[float]], List[Optional[float]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-        sem = asyncio.Semaphore(max(1, args.concurrency))
-        geo_cache: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
-        clean_cache: Dict[str, Optional[str]] = {}
-        lock = asyncio.Lock()
-        geocode_logs: List[Dict[str, Any]] = []
-        llm_logs: List[Dict[str, Any]] = []
+    # ===================================================================
+    # 좌표 처리: RECRUIT_COMPANY 테이블 우선 → geocoding fallback
+    # ===================================================================
+    if args.verbose:
+        print("[GEO] Step 1: RECRUIT_COMPANY 테이블에서 좌표 조회...")
 
-        async def task(i: int, row: pd.Series) -> Tuple[int, Optional[float], Optional[float]]:
-            lat, lon = await ageocode_with_fallback(
-                row.get("ADDRESS"),
-                row.get("REGION"),
-                llm_client,
-                sem=sem,
-                geo_cache=geo_cache,
-                clean_cache=clean_cache,
-                lock=lock,
-                geocode_logs=geocode_logs,
-                llm_logs=llm_logs,
-                board_idx=row.get("BOARD_IDX"),
-            )
-            return i, lat, lon
+    org_lats: List[Optional[float]] = [None] * len(df)
+    org_lons: List[Optional[float]] = [None] * len(df)
+    geocode_logs: List[Dict[str, Any]] = []
+    llm_logs: List[Dict[str, Any]] = []
 
-        if args.verbose:
-            print(f"[GEO] Start geocoding: total={len(df)}, concurrency={args.concurrency}, llm={'off' if args.no_llm else 'on'}")
-        start_ts = time.time()
-        tasks = [asyncio.create_task(task(i, df.iloc[i])) for i in range(len(df))]
-        results: List[Tuple[Optional[float], Optional[float]]] = [(None, None)] * len(df)
-        done = ok = fail = 0
-        for fut in asyncio.as_completed(tasks):
-            i, lat, lon = await fut
-            results[i] = (lat, lon)
-            done += 1
-            if lat is not None and lon is not None:
-                ok += 1
-            else:
-                fail += 1
-            if args.verbose and (done % max(1, args.log_interval) == 0 or done == len(df)):
-                elapsed = time.time() - start_ts
-                print(f"[GEO] progress {done}/{len(df)} ok={ok} fail={fail} elapsed={elapsed:.1f}s")
+    # RECRUIT_COMPANY에서 좌표 조회 시도
+    rc_coords_count = 0
+    if "U_ID" in df.columns:
+        u_ids = df["U_ID"].dropna().astype(str).unique().tolist()
+        if u_ids:
+            rc_coords = fetch_recruit_company_coordinates(u_ids)
+            for i, row in df.iterrows():
+                u_id = str(row.get("U_ID", "")).strip()
+                if u_id and u_id in rc_coords:
+                    lat, lon = rc_coords[u_id]
+                    if lat is not None and lon is not None:
+                        org_lats[i] = lat
+                        org_lons[i] = lon
+                        rc_coords_count += 1
 
-        lats = [lat for lat, _ in results]
-        lons = [lon for _, lon in results]
-        return lats, lons, geocode_logs, llm_logs
+    if args.verbose:
+        print(f"[GEO] RECRUIT_COMPANY 좌표: {rc_coords_count}/{len(df)}건 확보")
 
-    org_lats, org_lons, geocode_logs, llm_logs = asyncio.run(run_geocoding([df.iloc[i] for i in range(len(df))]))
+    # 좌표가 없는 공고에 대해 geocoding 수행
+    need_geocode_indices = [i for i in range(len(df)) if org_lats[i] is None or org_lons[i] is None]
+
+    if args.verbose:
+        print(f"[GEO] Step 2: Geocoding 필요: {len(need_geocode_indices)}건")
+
+    if need_geocode_indices:
+        async def run_geocoding(indices: List[int]) -> None:
+            sem = asyncio.Semaphore(max(1, args.concurrency))
+            geo_cache: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+            clean_cache: Dict[str, Optional[str]] = {}
+            lock = asyncio.Lock()
+
+            async def task(i: int, row: pd.Series) -> Tuple[int, Optional[float], Optional[float]]:
+                lat, lon = await ageocode_with_fallback(
+                    row.get("ADDRESS"),
+                    row.get("REGION"),
+                    llm_client,
+                    sem=sem,
+                    geo_cache=geo_cache,
+                    clean_cache=clean_cache,
+                    lock=lock,
+                    geocode_logs=geocode_logs,
+                    llm_logs=llm_logs,
+                    board_idx=row.get("BOARD_IDX"),
+                )
+                return i, lat, lon
+
+            if args.verbose:
+                print(f"[GEO] Start geocoding: total={len(indices)}, concurrency={args.concurrency}, llm={'off' if args.no_llm else 'on'}")
+            start_ts = time.time()
+            tasks = [asyncio.create_task(task(i, df.iloc[i])) for i in indices]
+            done = ok = fail = 0
+            for fut in asyncio.as_completed(tasks):
+                i, lat, lon = await fut
+                org_lats[i] = lat
+                org_lons[i] = lon
+                done += 1
+                if lat is not None and lon is not None:
+                    ok += 1
+                else:
+                    fail += 1
+                if args.verbose and (done % max(1, args.log_interval) == 0 or done == len(indices)):
+                    elapsed = time.time() - start_ts
+                    print(f"[GEO] progress {done}/{len(indices)} ok={ok} fail={fail} elapsed={elapsed:.1f}s")
+
+        asyncio.run(run_geocoding(need_geocode_indices))
+
+    # 최종 통계
+    final_ok = sum(1 for lat, lon in zip(org_lats, org_lons) if lat is not None and lon is not None)
+    if args.verbose:
+        print(f"[GEO] 최종 좌표 확보: {final_ok}/{len(df)}건 (RECRUIT_COMPANY: {rc_coords_count}, Geocoding: {final_ok - rc_coords_count})")
 
     # -----------------------------
     # 경력 요구사항 파싱/숫자화
     # -----------------------------
     def _parse_job_career_req(desc: Optional[str]) -> Tuple[Optional[int], Optional[int], int]:
-        """공고의 경력 요구사항 텍스트를 (min_years, max_years, is_irrelevant)로 변환.
-        규칙은 사용자 경력 정규화와 유사한 lower-bound 중심 처리.
-        - "경력무관" → (None, None, 1)
-        - "신입"/"신입가능" → (0, 1, 0)
-        - "N~M년" → (N, M, 0)
-        - "N년 이상" → (N, None, 0)
-        - 인식불가/없음 → (None, None, 1)  # 조건 없음으로 간주
-        """
+        """공고의 경력 요구사항 텍스트를 (min_years, max_years, is_irrelevant)로 변환."""
         try:
             s = str(desc) if desc is not None else ""
         except Exception:
@@ -478,76 +575,11 @@ def main() -> None:
             job_max_career_years.append(mx)
             job_is_career_irrelevant.append(int(irr))
     else:
-        # 컬럼이 없으면 조건 없음으로 처리
         job_min_career_years = [None] * len(df)
         job_max_career_years = [None] * len(df)
         job_is_career_irrelevant = [1] * len(df)
 
-    # 출력 DF 구성
-    # SERVICE_TYPE 원핫 인코딩 (SERVICE_1/2/3/9) + 7/8 → 2 매핑, 6은 학습 제외용 표시
-    svc = df.get("SERVICE_TYPE") if "SERVICE_TYPE" in df.columns else None
-    svc1: List[int] = []
-    svc2: List[int] = []
-    svc3: List[int] = []
-    svc9: List[int] = []
-    svc_orig_labels: List[str] = []
-    svc_mapped_labels: List[str] = []
-
-    def _parse_service_code_any(x: Any) -> Optional[int]:
-        # 숫자/문자 혼합 입력에서 서비스 코드 정수 추출
-        try:
-            if x is None:
-                return None
-            if isinstance(x, (int,)):
-                return int(x)
-            if isinstance(x, float):
-                import math as _math
-                return None if _math.isnan(x) else int(x)
-            s = str(x).strip()
-            if not s:
-                return None
-            # 우선 "SERVICE_7", "SERVICE7" 형태 처리
-            m = re.search(r"SERVICE[_ ]?(\d+)", s, flags=re.IGNORECASE)
-            if m:
-                return int(m.group(1))
-            # 숫자만 주어진 경우
-            m2 = re.search(r"(\d+)", s)
-            if m2:
-                return int(m2.group(1))
-            return None
-        except Exception:
-            return None
-
-    if svc is not None:
-        for v in svc:
-            orig_code = _parse_service_code_any(v)
-            orig_label = f"SERVICE_{orig_code}" if isinstance(orig_code, int) else (str(v).strip() if v is not None else "")
-
-            # 매핑 규칙: 7/8 → 2, 6 → 제외(원핫 전부 0), 1/2/3/9 유지
-            mapped_code: Optional[int]
-            if orig_code in (7, 8):
-                mapped_code = 2
-            elif orig_code == 6:
-                mapped_code = None
-            elif orig_code in (1, 2, 3, 9):
-                mapped_code = orig_code
-            else:
-                mapped_code = None
-
-            svc1.append(1 if mapped_code == 1 else 0)
-            svc2.append(1 if mapped_code == 2 else 0)
-            svc3.append(1 if mapped_code == 3 else 0)
-            svc9.append(1 if mapped_code == 9 else 0)
-            svc_orig_labels.append(orig_label)
-            svc_mapped_labels.append(f"SERVICE_{mapped_code}" if isinstance(mapped_code, int) else "")
-    else:
-        svc1 = [0] * len(df)
-        svc2 = [0] * len(df)
-        svc3 = [0] * len(df)
-        svc9 = [0] * len(df)
-        svc_orig_labels = [""] * len(df)
-        svc_mapped_labels = [""] * len(df)
-    # TITLE + CONTENT 임베딩
+    # TITLE + CONTENT 임베딩 (Gemini embedding-001, 3072d, SEMANTIC_SIMILARITY)
     job_texts = []
     job_indices = []
     if not args.no_embed:
@@ -558,18 +590,20 @@ def main() -> None:
             if t:
                 job_texts.append(t)
                 job_indices.append(i)
-    emb_client = None if args.no_embed else get_embedding_client()
-    if args.verbose:
-        print(f"[EMBED] client={'on' if emb_client is not None else 'off'} model={args.embed_model} batch={args.embed_batch}")
-    emb_vecs = _batch_embed_texts(emb_client, job_texts, model=args.embed_model, batch_size=max(1, int(args.embed_batch))) if not args.no_embed else []
 
-    df["JOB_EMB_4096"] = pd.NA
+    if args.verbose:
+        print(f"[EMBED] Gemini embedding-001 (3072d, SEMANTIC_SIMILARITY): {len(job_texts)}건, workers={args.embed_workers}")
+
+    # Gemini embedding 사용 (2000 토큰 초과 시 자동 요약, 병렬 처리)
+    emb_vecs = _batch_embed_texts_gemini(job_texts, verbose=True, log_interval=args.log_interval, max_workers=args.embed_workers) if not args.no_embed else []
+
+    df["JOB_EMB_3072"] = pd.NA
     for ridx, vec in zip(job_indices, emb_vecs):
         if vec is not None:
             try:
-                df.at[ridx, "JOB_EMB_4096"] = json.dumps(vec, ensure_ascii=False)
+                df.at[ridx, "JOB_EMB_3072"] = json.dumps(vec, ensure_ascii=False)
             except Exception:
-                df.at[ridx, "JOB_EMB_4096"] = pd.NA
+                df.at[ridx, "JOB_EMB_3072"] = pd.NA
 
     out_df = pd.DataFrame({
         "BOARD_IDX": df.get("BOARD_IDX"),
@@ -577,20 +611,12 @@ def main() -> None:
         "PAY": pays,
         "ORG_lat": org_lats,
         "ORG_lon": org_lons,
-        "JOB_EMB_4096": df.get("JOB_EMB_4096"),
-        # 경력 요구사항 파생 특성들(가능 시)
+        "JOB_EMB_3072": df.get("JOB_EMB_3072"),
+        # 경력 요구사항 파생 특성들
         "CAREER_REQ_DESC": career_desc_series if career_desc_series is not None else None,
         "JOB_MIN_CAREER_YEARS": job_min_career_years,
         "JOB_MAX_CAREER_YEARS": job_max_career_years,
         "JOB_IS_CAREER_IRRELEVANT": job_is_career_irrelevant,
-        # SERVICE_TYPE one-hot
-        "SERVICE_1": svc1,
-        "SERVICE_2": svc2,
-        "SERVICE_3": svc3,
-        "SERVICE_9": svc9,
-        # 원본/매핑 서비스 라벨(학습 제외/디버깅용)
-        "SERVICE_ORIG": svc_orig_labels,
-        "SERVICE_MAPPED": svc_mapped_labels,
         # 공고 초대유형 문자열 (사용자 매칭용)
         "INVITE_TYPE": df.get("INVITE_TYPE"),
         # 조직 타입(CODE_NAME)
@@ -607,7 +633,8 @@ def main() -> None:
     notes.append(f"- {input_csv}\n\n")
     notes.append("처리 규칙:\n")
     notes.append("- PAY 월급 기준: Net=PAY_MONTH, Gross=CONVERTED_NET_MONTHLY_WON(없으면 즉시계산), Day=PAY_DAY*20\n")
-    notes.append("- 지오코딩: ADDRESS -> (실패시) LLM 정제 -> (실패시) REGION -> (실패시) 빈칸\n\n")
+    notes.append("- 좌표: RECRUIT_COMPANY(POS_X,POS_Y) 우선 -> ADDRESS -> LLM 정제 -> REGION -> 빈칸\n")
+    notes.append("- 임베딩: Gemini embedding-001 (3072d, SEMANTIC_SIMILARITY, 2000 토큰 초과 시 요약)\n\n")
     notes.append("출력 컬럼:\n")
     notes.append("- BOARD_IDX, SPECIALTIES, PAY, ORG_lat, ORG_lon\n")
     notes.append("- (옵션) CAREER_REQ_DESC, JOB_MIN_CAREER_YEARS, JOB_MAX_CAREER_YEARS, JOB_IS_CAREER_IRRELEVANT\n\n")

@@ -28,22 +28,19 @@ except Exception:  # pragma: no cover
 FEATURE_COLUMNS = [
     "spec_match",
     "distance_home",
-    "distance_office",
-#    "CAREER_YEARS",
-#    "PAY",
-    # 경력 매칭 관련 추가 특성
+    "distance_office",  # NaN 허용 (직장좌표 없는 유저)
+    "has_office",
     "career_match",
     "career_gap",
     "is_career_irrelevant",
-    # 서비스 타입 및 작업유형 매칭
-    "SERVICE_1",
-    "SERVICE_2",
-    "SERVICE_3",
-    "SERVICE_9",
+    # 작업유형 및 기관유형 매칭
     "WORK_TYPE",
     "ORG_MATCHING",
-    "similarity"
+    "similarity",
 ]
+
+# NaN 허용 feature 목록 (XGBoost가 자동 처리)
+FEATURES_ALLOW_NAN = ["distance_office", "similarity"]
 
 DEFAULT_XGB_PARAMS: Dict[str, Any] = {
     "n_estimators": 600,
@@ -68,6 +65,47 @@ DEFAULT_LGBM_PARAMS: Dict[str, Any] = {
 }
 
 
+def check_gpu_available() -> bool:
+    """CUDA GPU 사용 가능 여부 확인"""
+    try:
+        import torch
+        available = torch.cuda.is_available()
+        if available:
+            device_name = torch.cuda.get_device_name(0)
+            print(f"[GPU] CUDA 사용 가능: {device_name}")
+        return available
+    except ImportError:
+        pass
+
+    # torch 없으면 xgboost로 직접 확인
+    try:
+        import xgboost as xgb
+        # XGBoost 2.x 방식으로 GPU 테스트
+        test_params = {"device": "cuda", "tree_method": "hist"}
+        test_data = xgb.DMatrix([[0, 0], [1, 1]], label=[0, 1])
+        xgb.train(test_params, test_data, num_boost_round=1, verbose_eval=False)
+        print("[GPU] CUDA 사용 가능 (XGBoost 직접 확인)")
+        return True
+    except Exception:
+        pass
+
+    return False
+
+
+# 전역 GPU 상태 캐시
+_GPU_AVAILABLE: bool | None = None
+
+
+def get_gpu_status() -> bool:
+    """GPU 상태를 캐시하여 반환 (최초 1회만 확인)"""
+    global _GPU_AVAILABLE
+    if _GPU_AVAILABLE is None:
+        _GPU_AVAILABLE = check_gpu_available()
+        if not _GPU_AVAILABLE:
+            print("[GPU] CUDA 사용 불가 -> CPU 모드로 학습")
+    return _GPU_AVAILABLE
+
+
 def load_dataset(csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
     required_cols = ["applied", "doctor_id", "board_id"] + FEATURE_COLUMNS
@@ -75,9 +113,12 @@ def load_dataset(csv_path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    # Ensure correct dtypes for features and fill missing with 0 (robust to sparse features like similarity)
+    # Ensure correct dtypes for features
+    # distance_office, similarity는 NaN 유지 (XGBoost가 자동 처리), 나머지는 0으로 채움
     for c in FEATURE_COLUMNS:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+        if c not in FEATURES_ALLOW_NAN:
+            df[c] = df[c].fillna(0)
 
     # Handle label: coerce to numeric, drop only if label is missing
     df["applied"] = pd.to_numeric(df["applied"], errors="coerce")
@@ -120,6 +161,9 @@ def train_xgboost(
     X_valid = valid_df[FEATURE_COLUMNS].values
     y_valid = valid_df["applied"].values
 
+    # GPU 자동 감지
+    use_gpu = get_gpu_status()
+
     base_params = dict(
         objective="binary:logistic",
         eval_metric=["logloss", "auc"],
@@ -127,18 +171,35 @@ def train_xgboost(
         random_state=seed,
         n_jobs=max(1, os.cpu_count() or 1),
     )
-    if model_params.get("use_gpu", False):
-        # XGBoost 2.x: GPU는 device 매개변수만 사용 (gpu_id 금지)
-        base_params["device"] = "cuda"
-    base_params.update({k: v for k, v in (model_params or {}).items() if k not in ["use_gpu", "gpu_id"]})
-    model = XGBClassifier(**base_params)
 
-    model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_valid, y_valid)],
-        verbose=False,  # suppress stdout; we'll save eval history to file instead
-    )
+    # GPU 우선, 없으면 CPU
+    if use_gpu:
+        base_params["device"] = "cuda"
+
+    base_params.update({k: v for k, v in (model_params or {}).items() if k not in ["use_gpu", "gpu_id"]})
+
+    # GPU 학습 시도, 실패 시 CPU 폴백
+    try:
+        model = XGBClassifier(**base_params)
+        model.fit(
+            X_train,
+            y_train,
+            eval_set=[(X_valid, y_valid)],
+            verbose=False,
+        )
+    except Exception as e:
+        if use_gpu:
+            print(f"[XGBoost] GPU 학습 실패, CPU로 폴백: {e}")
+            base_params.pop("device", None)
+            model = XGBClassifier(**base_params)
+            model.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_valid, y_valid)],
+                verbose=False,
+            )
+        else:
+            raise
 
     y_prob = model.predict_proba(X_valid)[:, 1]
     metrics = evaluate_predictions(y_valid, y_prob)
@@ -167,34 +228,36 @@ def train_lightgbm(
     X_valid = valid_df[FEATURE_COLUMNS].values
     y_valid = valid_df["applied"].values
 
+    # GPU 자동 감지
+    use_gpu = get_gpu_status()
+
     base_params = dict(
         objective="binary",
         random_state=seed,
         n_jobs=max(1, os.cpu_count() or 1),
         metric=["binary_logloss", "auc"],
     )
-    if model_params.get("use_gpu", False):
-        # GPU가 없거나 OpenCL 미설치 환경에서는 CPU로 자동 폴백
-        try:
-            base_params["device"] = "gpu"
-            base_params["gpu_platform_id"] = 0
-            base_params["gpu_device_id"] = model_params.get("gpu_id", 0)
-        except Exception:
-            pass
-    base_params.update({k: v for k, v in (model_params or {}).items() if k not in ["use_gpu", "gpu_id"]})
-    model = LGBMClassifier(**base_params)
 
+    # GPU 우선, 없으면 CPU
+    if use_gpu:
+        base_params["device"] = "gpu"
+        base_params["gpu_platform_id"] = 0
+        base_params["gpu_device_id"] = 0
+
+    base_params.update({k: v for k, v in (model_params or {}).items() if k not in ["use_gpu", "gpu_id"]})
+
+    # GPU 학습 시도, 실패 시 CPU 폴백
     try:
+        model = LGBMClassifier(**base_params)
         model.fit(
             X_train,
             y_train,
             eval_set=[(X_valid, y_valid)],
         )
     except Exception as fit_err:
-        # GPU 환경 미설치(OpenCL 없음 등) 시 CPU로 자동 폴백하여 재시도
-        if model_params.get("use_gpu", False):
+        if use_gpu:
+            print(f"[LightGBM] GPU 학습 실패, CPU로 폴백: {fit_err}")
             base_params_cpu = {k: v for k, v in base_params.items() if k not in ["device", "gpu_platform_id", "gpu_device_id"]}
-            base_params_cpu["device"] = "cpu"
             model = LGBMClassifier(**base_params_cpu)
             model.fit(
                 X_train,
@@ -234,6 +297,10 @@ def train_logistic(
     y_train = train_df["applied"].values
     X_valid_df = valid_df[FEATURE_COLUMNS].copy()
     y_valid = valid_df["applied"].values
+
+    # Logistic Regression은 NaN을 지원하지 않으므로 0으로 impute (has_office 플래그가 이를 구분해줌)
+    X_train_df = X_train_df.fillna(0)
+    X_valid_df = X_valid_df.fillna(0)
 
     # Try statsmodels first for coefficients and p-values
     try:
@@ -448,10 +515,7 @@ def main() -> None:
     parser.add_argument("--group_by_doctor", action="store_true", help="doctor_id 기준 그룹 분할")
 
     # 하이퍼파라미터 CLI 인자 제거: 기본 상수와 JSON 병합 사용
-
-    # GPU settings
-    parser.add_argument("--use_gpu", action="store_true", help="Use GPU acceleration")
-    parser.add_argument("--gpu_id", type=int, default=0, help="GPU device ID")
+    # GPU는 자동 감지 (옵션 없음) - 있으면 GPU, 없으면 CPU 폴백
 
     # Bayesian optimization flags
     parser.add_argument("--tune", action="store_true")
@@ -531,11 +595,7 @@ def main() -> None:
                 "reg_alpha",
             }
             xgb_params.update({k: v for k, v in tuned_xgb.items() if k in allowed_keys})
-        xgb_params.update({
-            "scale_pos_weight": spw,
-            "use_gpu": args.use_gpu,
-            "gpu_id": args.gpu_id,
-        })
+        xgb_params["scale_pos_weight"] = spw
         xgb_model, xgb_metrics, xgb_imps = train_xgboost(
             train_df,
             valid_df,
@@ -566,11 +626,7 @@ def main() -> None:
                 "reg_alpha",
             }
             lgbm_params.update({k: v for k, v in tuned_lgbm.items() if k in allowed_keys})
-        lgbm_params.update({
-            "is_unbalance": True,
-            "use_gpu": args.use_gpu,
-            "gpu_id": args.gpu_id,
-        })
+        lgbm_params["is_unbalance"] = True
         lgbm_model, lgbm_metrics, lgbm_imps = train_lightgbm(
             train_df,
             valid_df,
@@ -648,23 +704,35 @@ def main() -> None:
             xgb_full_params.update({k: v for k, v in tuned_xgb.items() if k in allowed_keys})
         # scale_pos_weight on full data
         spw_full = compute_class_weights(y_all)
-        xgb_full_params.update({
-            "scale_pos_weight": spw_full,
-            "use_gpu": args.use_gpu,
-            "gpu_id": args.gpu_id,
-        })
+        xgb_full_params["scale_pos_weight"] = spw_full
 
         from xgboost import XGBClassifier
-        full_model = XGBClassifier(
+
+        # GPU 자동 감지
+        use_gpu = get_gpu_status()
+        full_base_params = dict(
             objective="binary:logistic",
             eval_metric=["logloss", "auc"],
             tree_method="hist",
             random_state=args.random_seed,
             n_jobs=max(1, os.cpu_count() or 1),
-            **{k: v for k, v in xgb_full_params.items() if k not in ["use_gpu", "gpu_id"]},
         )
-        # train with eval on training set to produce log
-        full_model.fit(X_all, y_all, eval_set=[(X_all, y_all)], verbose=False)
+        if use_gpu:
+            full_base_params["device"] = "cuda"
+        full_base_params.update({k: v for k, v in xgb_full_params.items() if k not in ["use_gpu", "gpu_id"]})
+
+        # GPU 학습 시도, 실패 시 CPU 폴백
+        try:
+            full_model = XGBClassifier(**full_base_params)
+            full_model.fit(X_all, y_all, eval_set=[(X_all, y_all)], verbose=False)
+        except Exception as e:
+            if use_gpu:
+                print(f"[XGBoost Full] GPU 학습 실패, CPU로 폴백: {e}")
+                full_base_params.pop("device", None)
+                full_model = XGBClassifier(**full_base_params)
+                full_model.fit(X_all, y_all, eval_set=[(X_all, y_all)], verbose=False)
+            else:
+                raise
         try:
             full_model.get_booster().save_model(os.path.join(run_dir, "xgb_full_model.json"))
         except Exception:
@@ -745,11 +813,7 @@ def run_kfold(df: pd.DataFrame, args: argparse.Namespace) -> None:
         if args.models in ("all", "xgb"):
             spw = compute_class_weights(train_df["applied"].values)
             xgb_params = dict(DEFAULT_XGB_PARAMS)
-            xgb_params.update({
-                "scale_pos_weight": spw,
-                "use_gpu": args.use_gpu,
-                "gpu_id": args.gpu_id,
-            })
+            xgb_params["scale_pos_weight"] = spw
             xgb_model, xgb_metrics, xgb_imps = train_xgboost(
                 train_df,
                 valid_df,
@@ -764,11 +828,7 @@ def run_kfold(df: pd.DataFrame, args: argparse.Namespace) -> None:
 
         if args.models in ("all", "lgbm"):
             lgbm_params = dict(DEFAULT_LGBM_PARAMS)
-            lgbm_params.update({
-                "is_unbalance": True,
-                "use_gpu": args.use_gpu,
-                "gpu_id": args.gpu_id,
-            })
+            lgbm_params["is_unbalance"] = True
             lgbm_model, lgbm_metrics, lgbm_imps = train_lightgbm(
                 train_df,
                 valid_df,
@@ -787,13 +847,15 @@ def run_kfold(df: pd.DataFrame, args: argparse.Namespace) -> None:
                 model_params={},
             )
             # Predict probabilities for reporting
+            # Logistic Regression은 NaN을 지원하지 않으므로 0으로 impute
+            X_valid_logi = pd.DataFrame(X_valid, columns=FEATURE_COLUMNS).fillna(0).values
             try:
                 import statsmodels.api as sm  # type: ignore
 
-                X_valid_sm = sm.add_constant(pd.DataFrame(X_valid, columns=FEATURE_COLUMNS), has_constant="add")
+                X_valid_sm = sm.add_constant(pd.DataFrame(X_valid_logi, columns=FEATURE_COLUMNS), has_constant="add")
                 y_prob = np.asarray(logi_model.predict(X_valid_sm), dtype=float)
             except Exception:
-                y_prob = logi_model.predict_proba(X_valid)[:, 1]
+                y_prob = logi_model.predict_proba(X_valid_logi)[:, 1]
             save_reports(fold_dir, "logi", logi_model, logi_metrics, logi_coefs, y_valid, y_prob)
             all_metrics["logi"].append(logi_metrics)
 
@@ -828,7 +890,7 @@ def run_tuning(df: pd.DataFrame, args: argparse.Namespace, base_out: str) -> Non
             splits = list(splitter.split(df[FEATURE_COLUMNS], df["applied"].values))
 
     def objective_xgb(trial: "optuna.trial.Trial") -> float:
-        # Suggest params
+        # Suggest params (GPU는 train_xgboost 내부에서 자동 감지)
         params = {
             "n_estimators": trial.suggest_int("n_estimators", 200, 1200, step=100),
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
@@ -838,8 +900,6 @@ def run_tuning(df: pd.DataFrame, args: argparse.Namespace, base_out: str) -> Non
             "min_child_weight": trial.suggest_float("min_child_weight", 1e-2, 10.0, log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-3, 10.0, log=True),
             "reg_alpha": trial.suggest_float("reg_alpha", 1e-3, 1.0, log=True),
-            "use_gpu": args.use_gpu,
-            "gpu_id": args.gpu_id,
         }
         if use_holdout:
             train_df, valid_df = stratified_split(df, test_size=args.test_size, seed=args.random_seed)
@@ -860,6 +920,7 @@ def run_tuning(df: pd.DataFrame, args: argparse.Namespace, base_out: str) -> Non
         return float(np.mean(aucs))
 
     def objective_lgbm(trial: "optuna.trial.Trial") -> float:
+        # GPU는 train_lightgbm 내부에서 자동 감지
         params = {
             "n_estimators": trial.suggest_int("n_estimators", 300, 2000, step=100),
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
@@ -870,8 +931,6 @@ def run_tuning(df: pd.DataFrame, args: argparse.Namespace, base_out: str) -> Non
             "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
             "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 1.0),
             "is_unbalance": True,
-            "use_gpu": args.use_gpu,
-            "gpu_id": args.gpu_id,
         }
         if use_holdout:
             train_df, valid_df = stratified_split(df, test_size=args.test_size, seed=args.random_seed)
@@ -905,5 +964,4 @@ def run_tuning(df: pd.DataFrame, args: argparse.Namespace, base_out: str) -> Non
 
 if __name__ == "__main__":
     main()
-
 

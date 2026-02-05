@@ -18,12 +18,12 @@ def run(cmd: list[str], *, cwd: Path, env: dict | None = None) -> None:
 
 
 def main() -> None:
-    # 고정 날짜 구간
-#    TRAIN_DATE_START = "2024-09-01"
-    TRAIN_DATE_START = "2025-03-01"
-    TRAIN_DATE_END = "2025-08-31"
-    TEST_DATE_START = "2025-09-01"
-    TEST_DATE_END = "2025-09-30"
+    # 고정 날짜 구간 (v2_gemini_embeddings)
+    # Train: 2025년 1~11월, Test: 2025년 12월
+    TRAIN_DATE_START = "2025-01-01"
+    TRAIN_DATE_END = "2025-11-30"
+    TEST_DATE_START = "2025-12-01"
+    TEST_DATE_END = "2025-12-31"
 
     # 출력 루트(작업 디렉토리 = 현재 실행 디렉토리)
     work_dir = Path.cwd()
@@ -47,17 +47,17 @@ def main() -> None:
     raw_test_dir = data_raw / "test"
     run([sys.executable, str(PROJECT_ROOT / "process" / "01.parse_raw_dataset.py"), "--out_dir", str(raw_test_dir)], cwd=work_dir, env=env_test)
 
-    # 2) User features 처리 (train/test)
+    # 2) User features 처리 (train/test) - 임베딩 로그는 항상 출력
     run([sys.executable, str(PROJECT_ROOT / "process" / "02.process_user_features.py"),
-         "--input", str(raw_train_dir / "user_features.csv"), "--out_dir", str(data_proc / "train")], cwd=work_dir)
+         "--input", str(raw_train_dir / "user_features.csv"), "--out_dir", str(data_proc / "train"), "--verbose"], cwd=work_dir)
     run([sys.executable, str(PROJECT_ROOT / "process" / "02.process_user_features.py"),
-         "--input", str(raw_test_dir / "user_features.csv"), "--out_dir", str(data_proc / "test")], cwd=work_dir)
+         "--input", str(raw_test_dir / "user_features.csv"), "--out_dir", str(data_proc / "test"), "--verbose"], cwd=work_dir)
 
-    # 3) Job features 처리 (train/test)
+    # 3) Job features 처리 (train/test) - 임베딩 로그는 항상 출력
     run([sys.executable, str(PROJECT_ROOT / "process" / "03.process_job_features.py"),
-         "--input", str(raw_train_dir / "job_features.csv"), "--out_dir", str(data_proc / "train"), "--concurrency", "50", "--log-interval", "500"], cwd=work_dir)
+         "--input", str(raw_train_dir / "job_features.csv"), "--out_dir", str(data_proc / "train"), "--concurrency", "50", "--log-interval", "500", "--verbose"], cwd=work_dir)
     run([sys.executable, str(PROJECT_ROOT / "process" / "03.process_job_features.py"),
-         "--input", str(raw_test_dir / "job_features.csv"), "--out_dir", str(data_proc / "test"), "--concurrency", "50", "--log-interval", "500"], cwd=work_dir)
+         "--input", str(raw_test_dir / "job_features.csv"), "--out_dir", str(data_proc / "test"), "--concurrency", "50", "--log-interval", "500", "--verbose"], cwd=work_dir)
 
     # 4) Training pairs 병합 (train/test)
     run([sys.executable, str(PROJECT_ROOT / "process" / "04.merge_to_training_table.py"),
